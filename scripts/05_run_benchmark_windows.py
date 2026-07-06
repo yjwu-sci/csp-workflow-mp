@@ -12,7 +12,8 @@ Differences from original 05_run_benchmark.py:
   * SIGALRM replaced with thread-based timeout (Windows has no SIGALRM).
   * RESULTS_DIR overridable via --output-dir; default is a NEW directory
     `results_windows_k10_retry50/`. Original `results/` is never touched.
-  * CIF directory overridable via --cif-dir (default D:/csp_mp_data/cifs).
+  * CIF directory overridable via --cif-dir (default: $CSP_MP_DATA_ROOT/cifs
+    or data/MP/cifs relative to the repo).
 
 Usage:
     conda activate csp
@@ -57,7 +58,11 @@ logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(os.environ["PROJECT_ROOT"])
 MERGED_CSV   = PROJECT_ROOT / "data" / "MP" / "metadata_with_descriptors.csv"
-DEFAULT_CIF_DIR     = Path(r"D:\csp_mp_data\cifs")
+# CIF directory can be redirected via CSP_MP_DATA_ROOT (useful when CIFs live
+# on a separate drive); otherwise defaults to data/MP/cifs under the repo.
+_MP_ROOT = Path(os.environ.get("CSP_MP_DATA_ROOT",
+                               PROJECT_ROOT / "data" / "MP"))
+DEFAULT_CIF_DIR     = _MP_ROOT / "cifs"
 MODEL_DIR    = PROJECT_ROOT / "csp_workflow_mp" / "csp_workflow_mp" / "models"
 DEFAULT_RESULTS_DIR = PROJECT_ROOT / "csp_workflow_mp" / "results_windows_k10_retry50"
 

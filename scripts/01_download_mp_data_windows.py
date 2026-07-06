@@ -24,10 +24,13 @@ import os
 import time
 from pathlib import Path
 
-# Windows: CIFs live on D:\ (1.8 TB free; the original Mac symlink in Google
-# Drive points to ~/csp_mp_data/cifs which doesn't exist on Windows).
-CIF_DIR = Path(r"D:\csp_mp_data\cifs")
-LOG_DIR = Path(r"D:\csp_mp_data\logs")
+# Storage location can be redirected via the CSP_MP_DATA_ROOT environment
+# variable (useful when the CIF store lives on an external drive). Defaults
+# to the repository's data/MP/ subtree.
+_ROOT = Path(os.environ.get("CSP_MP_DATA_ROOT",
+                            Path(__file__).resolve().parent.parent / "data" / "MP"))
+CIF_DIR = _ROOT / "cifs"
+LOG_DIR = _ROOT / "logs"
 CIF_DIR.mkdir(parents=True, exist_ok=True)
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
