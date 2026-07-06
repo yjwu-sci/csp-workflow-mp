@@ -1,0 +1,15 @@
+numpy
+pandas
+scipy
+scikit-learn
+xgboost
+pymatgen
+ase
+mp-api==0.44.0
+emmet-core==0.84.10  # 0.85+ requires Python 3.11 (typing.NotRequired)
+matplotlib
+seaborn
+torch
+mattersim
+jupyter
+pytest

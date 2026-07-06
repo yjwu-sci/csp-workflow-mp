@@ -1,0 +1,44 @@
+# Sensitive data
+.env
+*.key
+secrets/
+
+# MP API responses with potential metadata
+mp_raw_*.json
+
+# macOS metadata
+.DS_Store
+**/.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Large data files (tracked separately or via symlink)
+data/MP/cifs/
+data/MP/descriptors.npy
+data/MP/metadata.csv
+
+# Trained models (tracked via Zenodo, not Git)
+csp_workflow_mp/models/*.pkl
+csp_workflow_mp/models/*.joblib
+
+# Results (too large for Git; archived on Zenodo)
+results/
+results_windows_*/
+
+# Local archive directories (not for GitHub)
+_archive_logs/
+_archive/
+
+# Temporary files
+*.tmp
+*.log
