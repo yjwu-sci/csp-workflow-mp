@@ -1,0 +1,31 @@
+# Local pre-commit hooks for csp-workflow-mp.
+#
+# What runs on every `git commit`:
+#   1. Basic hygiene (trailing whitespace, EOF newline, merge conflicts).
+#   2. gitleaks — scans staged content for secrets (API keys, tokens,
+#      private keys, high-entropy strings). Any hit blocks the commit.
+#
+# Setup (first-time contributor):
+#   pip install pre-commit
+#   pre-commit install
+# After that, the hooks fire automatically on every `git commit`.
+#
+# Manual scan of the whole repo:
+#   pre-commit run --all-files
+#
+# Known false positives are allowlisted in .gitleaks.toml.
+
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.28.0
+    hooks:
+      - id: gitleaks
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: ['--maxkb=1000']    # block accidental commits of files > 1 MB

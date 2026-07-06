@@ -59,7 +59,7 @@ DEFAULT_MERGEABLE_ROLES = [
 @dataclass
 class SiteInfo:
     """Metadata for one crystallographic site in the template.
-    
+
     effective_capacity = multiplicity × total_occupancy, which equals the
     actual atom count contributed by this site to the unit cell.
     For full-occupancy sites this equals multiplicity.

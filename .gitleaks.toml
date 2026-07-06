@@ -1,0 +1,29 @@
+# gitleaks config for csp-workflow-mp.
+#
+# We rely on gitleaks' bundled default ruleset (title: "gitleaks legacy config").
+# The `[extend]` block below inherits every default detector, then adds an
+# allowlist of intentional strings that would otherwise trigger false positives.
+
+title = "csp-workflow-mp gitleaks config"
+
+[extend]
+useDefault = true
+
+# ── Allowlist ────────────────────────────────────────────────────────────────
+# Substrings / regex patterns that should NEVER be flagged as secrets.
+[allowlist]
+description = "Allowlist for intentional public strings"
+
+# Files that are known to contain placeholder tokens only.
+paths = [
+  '''(.*/)?README\.md''',
+  '''(.*/)?setup\.py''',
+]
+
+# Literal / regex matches that are always safe.
+regexes = [
+  # Placeholder used to teach users how to set their own Materials Project API key.
+  '''your_key_here''',
+  # Author identification — already public on the paper cover.
+  '''wu\.yenju@nims\.go\.jp''',
+]
