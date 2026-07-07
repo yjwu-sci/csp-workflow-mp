@@ -476,20 +476,25 @@ def main() -> None:
     )
 
     def agg(grp: pd.DataFrame) -> pd.Series:
-        n_total   = len(grp)
-        n_sub     = int(grp["sub_success"].sum())
-        n_valid   = int(grp["is_valid"].sum())
-        valid     = grp[grp["is_valid"]]
+        """Aggregate one strategy (or one strategy × n_el / sub_method) group.
+
+        All rates are computed on the valid subset (relaxation converged AND
+        |ΔV/V| < 15%), matching the definition used throughout the paper:
+        SG match / SM match / RMSD numbers appearing in the manuscript are
+        exactly these fractions.
+        """
+        n_total = len(grp)
+        n_sub   = int(grp["sub_success"].sum())
+        n_valid = int(grp["is_valid"].sum())
+        valid   = grp[grp["is_valid"]]
         return pd.Series({
-            "n_total":              n_total,
-            "n_sub_success":        n_sub,
-            "n_valid_subset":       n_valid,
-            "sub_success_rate":     n_sub / max(n_total, 1),
-            "sg_match_all":         float(grp["sg_match"].mean()),
-            "sg_match_valid":       float(valid["sg_match"].mean()) if n_valid else float("nan"),
-            "sm_match_all":         float(grp["sm_match"].mean()),
-            "sm_match_valid":       float(valid["sm_match"].mean()) if n_valid else float("nan"),
-            "rmsd_median_valid":    float(valid["rmsd_angstrom"].median()) if n_valid else float("nan"),
+            "n_total":          n_total,
+            "n_sub_success":    n_sub,
+            "n_valid_subset":   n_valid,
+            "sub_success_rate": n_sub / max(n_total, 1),
+            "sg_match":         float(valid["sg_match"].mean())         if n_valid else float("nan"),
+            "sm_match":         float(valid["sm_match"].mean())         if n_valid else float("nan"),
+            "rmsd_median":      float(valid["rmsd_angstrom"].median())  if n_valid else float("nan"),
         })
 
     agg_overall = raw.groupby("strategy").apply(agg).reset_index()
@@ -508,30 +513,32 @@ def main() -> None:
         f"Relaxation: BFGS + UnitCellFilter, fmax = {RELAX_FMAX} eV/Å, "
         f"{RELAX_STEPS} steps, |ΔV/V| < {int(VOL_CHANGE_MAX*100)}% valid filter",
         "",
+        "SG match, SM match, and RMSD are computed on the valid subset "
+        "(substitution succeeded, relaxation converged, and |ΔV/V| < 15%).",
+        "",
         "## Overall results",
         "",
-        "| Strategy | n_total | sub_success | n_valid | SG match (all 500) | SG match (valid) | SM match (valid) | RMSD median (valid, Å) |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|",
+        "| Strategy | n_total | sub_success | n_valid | SG match | SM match | RMSD median (Å) |",
+        "|---|---:|---:|---:|---:|---:|---:|",
     ]
     for _, r in agg_overall.iterrows():
         lines.append(
             f"| {r['strategy']} | {int(r['n_total'])} "
             f"| {int(r['n_sub_success'])} ({r['sub_success_rate']*100:.1f}%) "
             f"| {int(r['n_valid_subset'])} "
-            f"| {r['sg_match_all']*100:.1f}% "
-            f"| {r['sg_match_valid']*100:.1f}% "
-            f"| {r['sm_match_valid']*100:.1f}% "
-            f"| {r['rmsd_median_valid']:.3f} |"
+            f"| {r['sg_match']*100:.1f}% "
+            f"| {r['sm_match']*100:.1f}% "
+            f"| {r['rmsd_median']:.3f} |"
         )
     lines += ["", "## By number of constituent elements",
               "",
-              "| Strategy | n_el | n_total | n_valid | SG match (valid) |",
+              "| Strategy | n_el | n_total | n_valid | SG match |",
               "|---|---:|---:|---:|---:|"]
     for _, r in agg_nelem.iterrows():
         lines.append(
             f"| {r['strategy']} | {int(r['n_elements'])} "
             f"| {int(r['n_total'])} | {int(r['n_valid_subset'])} "
-            f"| {r['sg_match_valid']*100:.1f}% |"
+            f"| {r['sg_match']*100:.1f}% |"
         )
 
     report = "\n".join(lines) + "\n"

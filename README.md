@@ -59,58 +59,90 @@ other environment variable is required.
 
 ## Quick start
 
-Give the package a chemical formula and get back a ranked list of
-symmetry-compatible structure templates:
+The following snippet walks a chemical formula through the entire pipeline
+— predict space group → retrieve templates → substitute → relax with
+MatterSim → write out the predicted CIF — using KTaO₃ (a cubic
+perovskite in space group 221) as the demonstration target.
+
+Prerequisites: complete steps 1 – 3 of the [reproduction pipeline](#reproducing-the-paper-benchmark) so that the descriptor table
+(`data/MP/metadata_with_descriptors.csv`), CIF files (`data/MP/cifs/`), and
+trained classifier (`csp_workflow_mp/models/xgb_sg.pkl`) are all in place.
 
 ```python
+from pathlib import Path
+from ase.optimize import BFGS
+from ase.filters import UnitCellFilter
+from pymatgen.core import Structure
+from pymatgen.io.ase import AseAtomsAdaptor
+from mattersim.forcefield import MatterSimCalculator
+
 from csp_workflow_mp import (
     compute_periodic_descriptors,
     predict_top_k_space_groups,
     TemplatePool,
+    SubstitutionEngine,
 )
 
 # 1. Encode the target formula as a 36-dim periodic descriptor.
 formula = "KTaO3"
 desc = compute_periodic_descriptors(formula)
 
-# 2. Predict its most likely space group with the trained classifier.
-top_sg  = predict_top_k_space_groups(desc, k=1)[0]
-top_3   = predict_top_k_space_groups(desc, k=3)
-print(f"top-1 SG = {top_sg}   top-3 SG = {top_3}")
+# 2. Predict the top space group with the trained classifier.
+top_sg = predict_top_k_space_groups(desc, k=1)[0]
+print(f"top-1 predicted SG: {top_sg}")
 
-# 3. Load the template pool (produced by scripts/01_download_mp_data.py
-#    and scripts/02_compute_descriptors.py).
+# 3. Load the template pool and retrieve the descriptor-nearest MP
+#    entries whose space group matches the classifier's top-1 prediction.
 pool = TemplatePool(
     "data/MP/metadata_with_descriptors.csv",
     cif_root="data/MP/cifs",
 )
-
-# 4. Retrieve the top-20 templates whose space group matches the
-#    classifier's top-1 prediction, ranked by descriptor cosine distance.
 hits = pool.search(space_group=top_sg, descriptor_vector=desc, top_n=20)
-print(hits[["material_id", "formula", "pd_distance"]].head())
+top_template = hits.iloc[0]
+print(f"top template : {top_template['material_id']}  {top_template['formula']}")
+
+# 4. Substitute the target elements onto the top template using
+#    the chemical-role–aware substitution engine.
+template_struct = Structure.from_file(f"data/MP/cifs/{top_template['material_id']}.cif")
+engine   = SubstitutionEngine()
+results  = engine.find_substitutions(formula, template_struct)
+feasible = next(r for r in results if r.success)
+predicted = engine.apply_substitution(template_struct, feasible)
+
+# 5. Relax the predicted structure with MatterSim (BFGS + UnitCellFilter).
+adaptor  = AseAtomsAdaptor()
+atoms    = adaptor.get_atoms(predicted)
+atoms.calc = MatterSimCalculator(device="cuda")   # or "cpu" / "mps"
+opt      = BFGS(UnitCellFilter(atoms), logfile=None)
+opt.run(fmax=0.05, steps=500)
+relaxed  = adaptor.get_structure(atoms)
+
+# 6. Write the predicted structure to a CIF file.
+out_cif = Path("KTaO3_predicted.cif")
+relaxed.to(filename=str(out_cif))
+print(f"wrote {out_cif}")
 ```
 
-The next stage is element substitution and MatterSim relaxation, shown in `notebooks/03_predict_new_composition.ipynb`.
+`notebooks/01_predict_new_composition.ipynb` runs the same recipe end to end and adds a comparison against the MP reference (mp-3614).
 
-> **On disordered targets and relaxation.** `MatterSim` expects a single
+> **On disordered targets and relaxation.** MatterSim expects a single
 > chemical species at every atomic site, so a candidate structure that carries
 > partial occupancies must first be ordered. The pipeline applies a
 > dominant-species approximation (replace each partially occupied site by its
 > most abundant element) before relaxation. This is discussed in the paper
-> Methods (§4.5) and its implications are laid out in the SI.
+> Methods (§4.5).
 
 ## Examples
 
 | Example | Runtime | Requires | What you get |
 |---|---|---|---|
-| **`notebooks/03_predict_new_composition.ipynb`** | 10–15 min | full install + trained model + downloaded MP data + MatterSim | Realistic single-composition prediction using KTaO₃: formula → SG prediction → template retrieval on MP → substitution → MatterSim relaxation → CIF output. |
-| **[Reproducing the paper benchmark](#reproducing-the-paper-benchmark)** | ~2 h + benchmark | full install + MP API key + ~300 MB free disk for CIFs | Reproduces the 500-target LOEO benchmark under each retrieval strategy. Regenerates every number in the main-text tables from scratch. |
-| **`notebooks/02_visualise_predictions.ipynb`** | ~30 s | `results/benchmark_raw.csv` from the reproduction step above | Diagnostic figures for benchmark output: per-stage success rates, RMSD distribution, per-complexity breakdown. |
+| **`notebooks/01_predict_new_composition.ipynb`** | 10–15 min | full install + trained model + downloaded MP data + MatterSim | Realistic single-composition prediction using KTaO₃: formula → SG prediction → template retrieval on MP → substitution → MatterSim relaxation → CIF output. |
+| **[Reproducing the paper benchmark](#reproducing-the-paper-benchmark)** | ~2 h + benchmark | full install + MP API key + ~300 MB free disk for CIFs | Reproduces the 500-target LOEO benchmark under each retrieval strategy. |
+| **`notebooks/02_visualise_predictions.ipynb`** | ~30 s | `results/benchmark_raw.csv` from the reproduction step above | Diagnostic figures for benchmark output: per-stage success rates, RMSD distribution, per-complexity SG-match breakdown. |
 
 ## Reproducing the paper benchmark
 
-The leave-one-entry-out (LOEO) benchmark in the paper (500 MP targets, seed 42) can be reproduced end-to-end from this repository. The complete pipeline is:
+The leave-one-entry-out (LOEO) benchmark in the paper (500 MP targets, seed 42) can be reproduced end-to-end from this repository:
 
 ```bash
 # 1. Download MP structural data (~300 MB of CIFs) — needs MP_API_KEY.
@@ -129,26 +161,25 @@ python scripts/05_run_benchmark.py --k 3              # SG-guided K = 3
 python scripts/05_run_benchmark.py --k 10             # SG-guided K = 10
 ```
 
-`05_run_benchmark.py --help` lists all flags (device selection, custom output directory, resume support, sample count, seed).
+`05_run_benchmark.py --help` lists all flags (device selection, custom output directory, resume support, sample count, seed). The aggregated report at `results/benchmark_report.md` reports SG match, SM match, and RMSD on the valid subset (the same definition the paper uses).
 
 Trained model files (`csp_workflow_mp/models/xgb_sg.pkl`, `xgb_ps.pkl`) are not committed to this repository because of their file size. They are regenerated by step 3 above.
-
-### Reading the aggregated report
-
-Each benchmark run writes a `benchmark_report.md` alongside the raw CSV. The overall table exposes **both** the all-500-target denominator (end-to-end SG-correct yield) and the valid-subset denominator (matches the paper's headline numbers):
-
-| Denominator | What it measures | Reported in the paper as |
-|---|---|---|
-| `sg_match_all` — n / 500 | End-to-end yield including substitution / relaxation / volume filtering failures | Discussion / SI end-to-end column |
-| `sg_match_valid` — n / |valid subset| | SG match on the valid relaxation subset (converged + \|ΔV/V\| < 15 %) | Main-text Table 2 (31.2 % and 57.5 %) |
-
-### A note on classifier holdout
-
-The classifier is trained on the same MP pool that the 500 benchmark targets are sampled from (only the target's own MP-ID is excluded at retrieval time). The paper's Supplementary Information reports a full out-of-fold (OOF) sensitivity analysis showing that the K = 10 result is essentially insensitive to this leakage and the K = 1 result has a conservative-bound SG match rate of at least 46.3 % — so the main claim (SG-guided retrieval > unconstrained) is robust to the entry-level holdout. See SI §S5.
 
 ## Data
 
 Training data: Materials Project, `e_above_hull < 0.1 eV/atom`, `Z ≤ 95` (CC-BY 4.0). CIF files are downloaded via `scripts/01_download_mp_data.py`.
+
+## Acknowledgements
+
+This work builds on a number of open-source projects. Please cite them when using this repository. See [NOTICES.md](NOTICES.md) for full license text and citation entries.
+
+- [XGBoost](https://xgboost.readthedocs.io) — Apache-2.0 — Chen & Guestrin, KDD 2016.
+- [pymatgen](https://pymatgen.org) — MIT — Ong et al., *Comput. Mater. Sci.* 68, 314-319 (2013).
+- [spglib](https://spglib.readthedocs.io) — BSD-3-Clause — Togo, Shinohara & Tanaka, *STAM: Methods* 4, 2384822 (2024).
+- [Atomic Simulation Environment (ASE)](https://wiki.fysik.dtu.dk/ase/) — LGPL-2.1 — Larsen et al., *J. Phys.: Condens. Matter* 29, 273002 (2017).
+- [DScribe](https://singroup.github.io/dscribe/) — Apache-2.0 — Himanen et al., *Comput. Phys. Commun.* 247, 106949 (2020).
+- [MatterSim](https://github.com/microsoft/mattersim) — MIT — Yang et al., arXiv:2405.04967 (2024).
+- [Materials Project](https://next-gen.materialsproject.org/) — CC-BY 4.0 — Jain et al., *APL Materials* 1, 011002 (2013).
 
 ## Citation
 
