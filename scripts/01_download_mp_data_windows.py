@@ -24,15 +24,25 @@ import os
 import time
 from pathlib import Path
 
-# Storage location can be redirected via the CSP_MP_DATA_ROOT environment
-# variable (useful when the CIF store lives on an external drive). Defaults
-# to the repository's data/MP/ subtree.
-_ROOT = Path(os.environ.get("CSP_MP_DATA_ROOT",
-                            Path(__file__).resolve().parent.parent / "data" / "MP"))
-CIF_DIR = _ROOT / "cifs"
-LOG_DIR = _ROOT / "logs"
-CIF_DIR.mkdir(parents=True, exist_ok=True)
-LOG_DIR.mkdir(parents=True, exist_ok=True)
+# --- canonical repository paths (see csp_workflow_mp/_paths.py) ---
+import sys as _sys
+_HERE = Path(__file__).resolve().parent
+if str(_HERE.parent) not in _sys.path:
+    _sys.path.insert(0, str(_HERE.parent))
+from csp_workflow_mp._paths import (
+    REPO_ROOT as PROJECT_ROOT,
+    DATA_ROOT,
+    CIF_DIR,
+    METADATA_CSV,
+    METADATA_WITH_DESCRIPTORS_CSV,
+    DESCRIPTORS_NPY,
+    MODEL_DIR,
+    RESULTS_DIR,
+    LOG_DIR,
+    ensure_data_dirs,
+)
+
+ensure_data_dirs()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -43,9 +53,6 @@ logging.basicConfig(
     ],
 )
 logger = logging.getLogger(__name__)
-
-PROJECT_ROOT = Path(os.environ["PROJECT_ROOT"])
-METADATA_CSV = PROJECT_ROOT / "data" / "MP" / "metadata.csv"
 
 METADATA_COLS = [
     "material_id", "formula", "space_group_number",

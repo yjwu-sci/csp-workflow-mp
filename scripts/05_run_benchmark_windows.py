@@ -56,15 +56,27 @@ from structural_eval_helpers import sym_order_sm_match, soap_cosine_similarity
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-PROJECT_ROOT = Path(os.environ["PROJECT_ROOT"])
-MERGED_CSV   = PROJECT_ROOT / "data" / "MP" / "metadata_with_descriptors.csv"
-# CIF directory can be redirected via CSP_MP_DATA_ROOT (useful when CIFs live
-# on a separate drive); otherwise defaults to data/MP/cifs under the repo.
-_MP_ROOT = Path(os.environ.get("CSP_MP_DATA_ROOT",
-                               PROJECT_ROOT / "data" / "MP"))
-DEFAULT_CIF_DIR     = _MP_ROOT / "cifs"
-MODEL_DIR    = PROJECT_ROOT / "csp_workflow_mp" / "csp_workflow_mp" / "models"
-DEFAULT_RESULTS_DIR = PROJECT_ROOT / "csp_workflow_mp" / "results_windows_k10_retry50"
+# --- canonical repository paths (see csp_workflow_mp/_paths.py) ---
+import sys as _sys
+_HERE = Path(__file__).resolve().parent
+if str(_HERE.parent) not in _sys.path:
+    _sys.path.insert(0, str(_HERE.parent))
+from csp_workflow_mp._paths import (
+    REPO_ROOT as PROJECT_ROOT,
+    DATA_ROOT,
+    CIF_DIR,
+    METADATA_CSV,
+    METADATA_WITH_DESCRIPTORS_CSV,
+    DESCRIPTORS_NPY,
+    MODEL_DIR,
+    RESULTS_DIR,
+    LOG_DIR,
+    ensure_data_dirs,
+)
+MERGED_CSV   = METADATA_WITH_DESCRIPTORS_CSV
+DEFAULT_CIF_DIR     = CIF_DIR
+# MODEL_DIR imported from _paths
+DEFAULT_RESULTS_DIR = RESULTS_DIR / "windows_k10_retry50"
 
 COEF_COLS = [f"coef_{i:02d}" for i in range(1, 19)]
 PROP_COLS  = [f"prop_{i:02d}" for i in range(1, 19)]

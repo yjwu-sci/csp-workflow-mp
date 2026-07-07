@@ -1,42 +1,58 @@
 """
-Phase 4: 500-sample LOO benchmark (full pipeline).
+LOEO benchmark on Materials Project.
 
-For each of 500 randomly sampled MP materials (seed=42):
-  1. Exclude target from template pool (leave-one-out).
-  2. Retrieve top-1 template via three strategies:
-       Strategy A — unconstrained: cosine-similarity nearest neighbour, no filter
-       Strategy B — sg_only:       filter pool to top-3 predicted SGs
-       Strategy C — sg_ps:         SG+PS compatibility filter (top-5 SG × top-5 PS,
-                                   crystallographic compatibility check, same as AWA paper)
-  3. Perform ion substitution with SubstitutionEngine.
-  4. Relax with MatterSim: BFGS + UnitCellFilter, fmax=0.05 eV/Å, 500 steps
-     (matches AWA paper methodology exactly).
-  5. Apply |ΔV/V| < 15% volume-change filter.
-  6. Compare relaxed structure to ground-truth via:
-       - SpacegroupAnalyzer  → sg_match  (relaxed SG == true SG)
-       - StructureMatcher    → sm_match + rmsd_angstrom
+For each target sampled from the MP pool the pipeline is:
+  1. Exclude the target's own material_id from the template pool
+     (leave-one-entry-out).
+  2. Retrieve the top template by descriptor cosine similarity, subject
+     to the strategy's SG mask (or no mask for the unconstrained case).
+  3. Attempt a chemical-role substitution onto the retrieved template.
+  4. Relax the substituted structure with MatterSim (BFGS + UnitCellFilter,
+     fmax = 0.05 eV/Å, up to 500 steps; timeout 300 s).
+  5. Apply the |ΔV/V| < 15% valid-subset filter.
+  6. Compare the relaxed structure against ground truth:
+       * SpacegroupAnalyzer → sg_match
+       * StructureMatcher   → sm_match + rmsd_angstrom
 
-Checkpointing: results appended to CSV after each sample; run is resumable.
+The script writes a per-target raw CSV, three aggregated CSVs, and a
+Markdown report.
 
-Usage:
+Basic usage
+-----------
     conda activate csp
-    python scripts/05_run_benchmark.py
+    export MP_API_KEY="..."             # download / classifier training
+    python scripts/05_run_benchmark.py                   # all strategies
+    python scripts/05_run_benchmark.py --k 1             # SG-guided, K=1
+    python scripts/05_run_benchmark.py --unconstrained   # unconstrained only
 
-Input:   data/MP/metadata_with_descriptors.csv + cifs/
-         csp_workflow_mp/models/xgb_sg.pkl
-         csp_workflow_mp/models/xgb_ps.pkl
-Output:  results/benchmark_raw.csv
-         results/benchmark_results.csv
-         results/benchmark_report.md
+For every retrieval strategy the aggregated report exposes both the
+all-500-target denominator and the valid-subset denominator, so the
+paper numbers (31.2% and 57.5% on the valid subset) can be
+recomputed from the raw CSV without any post-processing.
+
+Inputs
+------
+    data/MP/metadata_with_descriptors.csv
+    data/MP/cifs/{mp-id}.cif                   (or $CSP_MP_CIF_DIR)
+    csp_workflow_mp/models/xgb_sg.pkl          (produced by 03_train_xgboost.py)
+    csp_workflow_mp/models/xgb_ps.pkl          (only if --strategy sg_ps)
+
+Outputs (under --output-dir, default: results/)
+    benchmark_raw.csv
+    benchmark_results.csv
+    benchmark_by_nelements.csv
+    benchmark_by_method.csv
+    benchmark_report.md
 """
 
 from __future__ import annotations
 
+import argparse
 import logging
-import os
 import pickle
-import signal
+import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 from pathlib import Path
 
 import numpy as np
@@ -45,56 +61,141 @@ from pymatgen.analysis.structure_matcher import StructureMatcher
 from pymatgen.core import Structure
 from pymatgen.io.ase import AseAtomsAdaptor
 
-from csp_workflow_mp.substitution_engine import SubstitutionEngine
-from csp_workflow_mp.symmetry_filter import filter_compatible_pairs
+# --- canonical repository paths (see csp_workflow_mp/_paths.py) ---
+_HERE = Path(__file__).resolve().parent
+if str(_HERE.parent) not in sys.path:
+    sys.path.insert(0, str(_HERE.parent))
+from csp_workflow_mp._paths import (      # noqa: E402
+    METADATA_WITH_DESCRIPTORS_CSV,
+    CIF_DIR as DEFAULT_CIF_DIR,
+    MODEL_DIR as DEFAULT_MODEL_DIR,
+    RESULTS_DIR as DEFAULT_RESULTS_DIR,
+    ensure_data_dirs,
+)
+from csp_workflow_mp.substitution_engine import SubstitutionEngine   # noqa: E402
+from csp_workflow_mp.symmetry_filter import filter_compatible_pairs  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-PROJECT_ROOT = Path(os.environ["PROJECT_ROOT"])
-MERGED_CSV   = PROJECT_ROOT / "data" / "MP" / "metadata_with_descriptors.csv"
-CIF_DIR      = PROJECT_ROOT / "data" / "MP" / "cifs"
-MODEL_DIR    = PROJECT_ROOT / "csp_workflow_mp" / "csp_workflow_mp" / "models"
-RESULTS_DIR  = PROJECT_ROOT / "csp_workflow_mp" / "results"
 
 COEF_COLS = [f"coef_{i:02d}" for i in range(1, 19)]
-PROP_COLS  = [f"prop_{i:02d}" for i in range(1, 19)]
-DESC_COLS  = COEF_COLS + PROP_COLS
+PROP_COLS = [f"prop_{i:02d}" for i in range(1, 19)]
+DESC_COLS = COEF_COLS + PROP_COLS
 
-N_SAMPLES       = 500
-RANDOM_STATE    = 42
-SG_FILTER_P     = 3       # top-P SGs for sg_only strategy
-SG_PS_TOP_K     = 5       # top-K SGs and PSs for sg_ps compatibility filter
+# Relaxation settings — identical to the AWA paper (Section 5.6).
+RELAX_FMAX     = 0.05        # eV/Å
+RELAX_STEPS    = 500
+RELAX_TIMEOUT  = 300         # seconds per structure
+VOL_CHANGE_MAX = 0.15        # |ΔV/V| < 15%
 
-# Relaxation settings — identical to AWA paper (Section 5.6)
-RELAX_FMAX      = 0.05    # eV/Å
-RELAX_STEPS     = 500
-RELAX_TIMEOUT   = 300     # seconds per structure
-VOL_CHANGE_MAX  = 0.15    # |ΔV/V| < 15%
-DEVICE          = "mps"
-
-STRATEGIES = ["unconstrained", "sg_only", "sg_ps"]
-RAW_CSV    = RESULTS_DIR / "benchmark_raw.csv"
+ALL_STRATEGIES = ["unconstrained", "sg_only", "sg_ps"]
 
 
-# ── Timeout helper ────────────────────────────────────────────────────────────
-class _Timeout(Exception):
-    pass
+# ─────────────────────── CLI ────────────────────────────────────────────────
 
-def _alarm_handler(signum, frame):
-    raise _Timeout()
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description=__doc__.split("\n\n", 1)[0],
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument(
+        "--k", type=int, default=None,
+        help="Top-K SG mask for sg_only retrieval (paper: K=1 primary, K=3, K=10). "
+             "When set this also implies --strategy sg_only.",
+    )
+    p.add_argument(
+        "--strategy", default=None, choices=ALL_STRATEGIES,
+        help="Run a single retrieval strategy. If omitted and --k is not set, "
+             "runs 'unconstrained' + 'sg_only'. --unconstrained is a shortcut.",
+    )
+    p.add_argument(
+        "--unconstrained", action="store_true",
+        help="Shortcut for --strategy unconstrained.",
+    )
+    p.add_argument(
+        "--sg-ps-top-k", type=int, default=5,
+        help="Top-K for the SG×PS compatibility filter (only used by strategy sg_ps).",
+    )
+    p.add_argument(
+        "--n-samples", type=int, default=500,
+        help="Number of LOEO test targets to sample from the MP pool.",
+    )
+    p.add_argument(
+        "--seed", type=int, default=42,
+        help="Random seed for target sampling.",
+    )
+    p.add_argument(
+        "--device", default="auto", choices=["auto", "cuda", "mps", "cpu"],
+        help="MatterSim device. 'auto' picks cuda > mps > cpu based on availability.",
+    )
+    p.add_argument(
+        "--data-csv", type=Path, default=METADATA_WITH_DESCRIPTORS_CSV,
+        help="Metadata + descriptor CSV (default: data/MP/metadata_with_descriptors.csv).",
+    )
+    p.add_argument(
+        "--cif-dir", type=Path, default=DEFAULT_CIF_DIR,
+        help="Directory of MP CIF files (default: data/MP/cifs).",
+    )
+    p.add_argument(
+        "--model-dir", type=Path, default=DEFAULT_MODEL_DIR,
+        help="Directory containing xgb_sg.pkl (and xgb_ps.pkl if using sg_ps).",
+    )
+    p.add_argument(
+        "--output-dir", type=Path, default=DEFAULT_RESULTS_DIR,
+        help="Directory for raw CSV, aggregated CSVs, and report.",
+    )
+    p.add_argument(
+        "--no-resume", action="store_true",
+        help="Ignore any existing benchmark_raw.csv and start from scratch.",
+    )
+    args = p.parse_args()
+
+    # ── strategy resolution ───────────────────────────────────────────────────
+    if args.unconstrained:
+        args.strategy = "unconstrained"
+
+    if args.k is not None and args.strategy is None:
+        args.strategy = "sg_only"
+
+    args.strategies = (
+        [args.strategy] if args.strategy is not None
+        else ["unconstrained", "sg_only"]
+    )
+    if args.k is None:
+        args.k = 3   # historical default for sg_only, kept for backwards compat
+
+    return args
 
 
-def relax_structure(structure, calc, adaptor):
+def resolve_device(choice: str) -> str:
+    if choice != "auto":
+        return choice
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return "cuda"
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return "mps"
+    except ImportError:
+        pass
+    return "cpu"
+
+
+# ─────────────────────── cross-platform relax ───────────────────────────────
+
+def relax_structure(structure, calc, adaptor, timeout: int = RELAX_TIMEOUT):
     """
-    Relax with MatterSim using BFGS + UnitCellFilter (cell + atomic relaxation).
-    Matches AWA paper methodology (Section 5.6).
+    Relax with MatterSim (BFGS + UnitCellFilter). Uses a thread-based
+    timeout so this works on Windows in addition to Linux/macOS.
+
     Returns (relaxed_structure, converged, elapsed, vol_change_frac).
-    Returns (None, False, elapsed, nan) for disordered structures or on timeout/error.
+    Returns (None, False, elapsed, nan) for disordered inputs, timeout,
+    or any exception during relaxation.
     """
     try:
         from ase.filters import UnitCellFilter
-    except ImportError:
+    except ImportError:                                      # pragma: no cover
         from ase.constraints import UnitCellFilter
     from ase.optimize import BFGS
 
@@ -105,64 +206,55 @@ def relax_structure(structure, calc, adaptor):
     vol0  = atoms.get_volume()
     atoms.calc = calc
 
-    signal.signal(signal.SIGALRM, _alarm_handler)
-    signal.alarm(RELAX_TIMEOUT)
-    t0 = time.time()
-    try:
+    def _do_relax():
         ucf = UnitCellFilter(atoms)
         opt = BFGS(ucf, logfile=None)
         opt.run(fmax=RELAX_FMAX, steps=RELAX_STEPS)
-        converged = opt.converged()
-    except _Timeout:
-        signal.alarm(0)
-        return None, False, RELAX_TIMEOUT, float("nan")
+        return opt.converged()
+
+    t0 = time.time()
+    try:
+        with ThreadPoolExecutor(max_workers=1) as ex:
+            converged = ex.submit(_do_relax).result(timeout=timeout)
+    except FuturesTimeout:
+        return None, False, timeout, float("nan")
     except Exception as exc:
-        signal.alarm(0)
         logger.debug("Relaxation error: %s", exc)
         return None, False, time.time() - t0, float("nan")
-    finally:
-        signal.alarm(0)
 
-    elapsed  = time.time() - t0
-    vol1     = atoms.get_volume()
-    dv       = abs(vol1 - vol0) / max(vol0, 1e-6)
-    relaxed  = adaptor.get_structure(atoms)
-    return relaxed, converged, elapsed, dv
+    elapsed = time.time() - t0
+    vol1    = atoms.get_volume()
+    dv      = abs(vol1 - vol0) / max(vol0, 1e-6)
+    return adaptor.get_structure(atoms), converged, elapsed, dv
 
 
-def sm_compare(s1: Structure, s2: Structure, matcher: StructureMatcher):
-    """Return (match, rmsd_angstrom). rmsd=nan on failure."""
+def sm_compare(s1, s2, matcher):
     try:
         match = matcher.fit(s1, s2)
         if match:
             rms, _ = matcher.get_rms_dist(s1, s2)
             avg_a  = (s1.lattice.a + s2.lattice.a) / 2
-            rmsd   = float(rms) * avg_a
-        else:
-            rmsd = float("nan")
-        return match, rmsd
+            return True, float(rms) * avg_a
+        return False, float("nan")
     except Exception:
         return False, float("nan")
 
 
 def get_relaxed_sg(structure) -> int | None:
-    """Return space group number of structure via SpacegroupAnalyzer."""
     try:
         from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
-        sga = SpacegroupAnalyzer(structure, symprec=0.1, angle_tolerance=5)
-        return sga.get_space_group_number()
+        return SpacegroupAnalyzer(
+            structure, symprec=0.1, angle_tolerance=5,
+        ).get_space_group_number()
     except Exception:
         return None
 
 
-def build_sg_ps_mask(sg_proba_i, ps_proba_i, y_sg, y_ps_enc, sg_enc, ps_enc):
-    """
-    SG+PS compatibility filter (AWA paper method):
-    Cartesian product of top-K SG × top-K PS → keep crystallographically
-    compatible pairs → pool mask.
-    """
-    top_k_sg_enc = np.argpartition(sg_proba_i, -SG_PS_TOP_K)[-SG_PS_TOP_K:]
-    top_k_ps_enc = np.argpartition(ps_proba_i, -SG_PS_TOP_K)[-SG_PS_TOP_K:]
+def build_sg_ps_mask(
+    sg_proba_i, ps_proba_i, y_sg, y_ps_enc, sg_enc, ps_enc, top_k: int,
+):
+    top_k_sg_enc = np.argpartition(sg_proba_i, -top_k)[-top_k:]
+    top_k_ps_enc = np.argpartition(ps_proba_i, -top_k)[-top_k:]
 
     sg_preds = [(int(sg_enc.inverse_transform([e])[0]), float(sg_proba_i[e]))
                 for e in top_k_sg_enc]
@@ -171,27 +263,36 @@ def build_sg_ps_mask(sg_proba_i, ps_proba_i, y_sg, y_ps_enc, sg_enc, ps_enc):
 
     compatible = filter_compatible_pairs(sg_preds, ps_preds, top_n=25)
     if not compatible:
-        return None   # fall back to unconstrained
+        return None
 
-    compat_sgs = {int(sg) for sg, ps, _ in compatible}
-    compat_ps  = {str(ps).strip() for sg, ps, _ in compatible}
-
-    # Pool members matching ANY compatible (SG, PS) pair
     sg_raw_arr = np.array([int(sg_enc.inverse_transform([e])[0]) for e in y_sg])
     ps_raw_arr = np.array([str(ps_enc.inverse_transform([e])[0]).strip() for e in y_ps_enc])
 
     mask = np.zeros(len(y_sg), dtype=bool)
     for sg, ps, _ in compatible:
         mask |= (sg_raw_arr == sg) & (ps_raw_arr == ps)
-
     return mask if mask.any() else None
 
 
-def main() -> None:
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+# ─────────────────────── main ───────────────────────────────────────────────
 
-    # ── Load data ─────────────────────────────────────────────────────────────
-    df = pd.read_csv(MERGED_CSV).dropna(subset=DESC_COLS).reset_index(drop=True)
+def main() -> None:
+    args = parse_args()
+    ensure_data_dirs()
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    raw_csv = args.output_dir / "benchmark_raw.csv"
+    device  = resolve_device(args.device)
+
+    logger.info("Strategies: %s", args.strategies)
+    logger.info("K = %d (sg_only mask width)", args.k)
+    logger.info("n_samples = %d, seed = %d, device = %s", args.n_samples, args.seed, device)
+    logger.info("Data:   %s", args.data_csv)
+    logger.info("CIFs:   %s", args.cif_dir)
+    logger.info("Model:  %s", args.model_dir)
+    logger.info("Output: %s", args.output_dir)
+
+    # ── Load data ────────────────────────────────────────────────────────────
+    df = pd.read_csv(args.data_csv).dropna(subset=DESC_COLS).reset_index(drop=True)
     logger.info("Loaded %d rows", len(df))
 
     sg_col = "space_group" if "space_group" in df.columns else "space_group_number"
@@ -199,111 +300,112 @@ def main() -> None:
 
     X        = df[DESC_COLS].to_numpy(dtype=np.float32)
     y_sg_raw = df[sg_col].values
-    y_ps_raw = df[ps_col].values.astype(str)
+    y_ps_raw = df[ps_col].values.astype(str) if ps_col in df.columns else None
     mat_ids  = df["material_id"].values
     nelems   = df["nelements"].values if "nelements" in df.columns else np.ones(len(df), int)
 
-    # ── Load models ───────────────────────────────────────────────────────────
-    with open(MODEL_DIR / "xgb_sg.pkl", "rb") as f:
+    # ── Load classifiers ────────────────────────────────────────────────────
+    with open(args.model_dir / "xgb_sg.pkl", "rb") as f:
         sg_pkg = pickle.load(f)
     sg_model, sg_enc = sg_pkg["model"], sg_pkg["encoder"]
 
-    with open(MODEL_DIR / "xgb_ps.pkl", "rb") as f:
-        ps_pkg = pickle.load(f)
-    ps_model, ps_enc = ps_pkg["model"], ps_pkg["encoder"]
+    if "sg_ps" in args.strategies:
+        with open(args.model_dir / "xgb_ps.pkl", "rb") as f:
+            ps_pkg = pickle.load(f)
+        ps_model, ps_enc = ps_pkg["model"], ps_pkg["encoder"]
+    else:
+        ps_model = ps_enc = None
 
-    logger.info("SG classes: %d  |  PS classes: %d", len(sg_enc.classes_), len(ps_enc.classes_))
+    logger.info("SG classes: %d", len(sg_enc.classes_))
 
-    # ── Filter to known classes ───────────────────────────────────────────────
-    known_sg = np.isin(y_sg_raw, sg_enc.classes_)
-    known_ps = np.isin(y_ps_raw, ps_enc.classes_)
-    known    = known_sg & known_ps
-    df       = df[known].reset_index(drop=True)
-    X        = X[known]; y_sg_raw = y_sg_raw[known]; y_ps_raw = y_ps_raw[known]
-    mat_ids  = mat_ids[known]; nelems = nelems[known]
+    # ── Filter to classes seen during training ──────────────────────────────
+    known_mask = np.isin(y_sg_raw, sg_enc.classes_)
+    if ps_enc is not None:
+        known_mask &= np.isin(y_ps_raw, ps_enc.classes_)
+    df       = df[known_mask].reset_index(drop=True)
+    X        = X[known_mask]
+    y_sg_raw = y_sg_raw[known_mask]
+    y_ps_raw = y_ps_raw[known_mask] if y_ps_raw is not None else None
+    mat_ids  = mat_ids[known_mask]
+    nelems   = nelems[known_mask]
     y_sg     = sg_enc.transform(y_sg_raw).astype(np.int32)
-    y_ps     = ps_enc.transform(y_ps_raw).astype(np.int32)
-    logger.info("After class filter: %d rows", len(df))
+    y_ps     = ps_enc.transform(y_ps_raw).astype(np.int32) if ps_enc is not None else None
 
-    # ── Sample 500 test indices ───────────────────────────────────────────────
-    rng      = np.random.default_rng(RANDOM_STATE)
-    test_idx = rng.choice(len(df), size=N_SAMPLES, replace=False)
+    # ── Sample targets ──────────────────────────────────────────────────────
+    rng      = np.random.default_rng(args.seed)
+    n_take   = min(args.n_samples, len(df))
+    test_idx = rng.choice(len(df), size=n_take, replace=False)
 
-    # ── Normalised descriptor matrix for cosine similarity ───────────────────
+    # ── Descriptor similarity matrix ────────────────────────────────────────
     norms  = np.linalg.norm(X, axis=1, keepdims=True)
     norms  = np.where(norms < 1e-12, 1.0, norms)
     X_norm = (X / norms).astype(np.float32)
-    logger.info("Computing similarity matrix (%d × %d) ...", N_SAMPLES, len(df))
+    logger.info("Computing similarity matrix (%d × %d) ...", n_take, len(df))
     S = X_norm[test_idx] @ X_norm.T
     for i, idx in enumerate(test_idx):
         S[i, idx] = -np.inf
-    logger.info("Similarity matrix ready.")
 
-    # ── Predict SG and PS probabilities ──────────────────────────────────────
-    logger.info("Predicting SG/PS probabilities for test samples ...")
-    sg_proba = sg_model.predict_proba(X[test_idx])
-    ps_proba = ps_model.predict_proba(X[test_idx])
+    # ── Classifier probabilities on targets ─────────────────────────────────
+    sg_proba = sg_model.predict_proba(X[test_idx]) if "sg_only" in args.strategies or "sg_ps" in args.strategies else None
+    ps_proba = ps_model.predict_proba(X[test_idx]) if "sg_ps" in args.strategies else None
 
-    # ── Load heavy objects once ───────────────────────────────────────────────
-    logger.info("Loading MatterSim (device=%s) ...", DEVICE)
+    # ── Load MatterSim, adaptor, substitution engine ────────────────────────
+    logger.info("Loading MatterSim on device=%s ...", device)
     import warnings; warnings.filterwarnings("ignore")
     from mattersim.forcefield import MatterSimCalculator
-    calc    = MatterSimCalculator(device=DEVICE)
+    calc    = MatterSimCalculator(device=device)
     adaptor = AseAtomsAdaptor()
     engine  = SubstitutionEngine()
     matcher = StructureMatcher(ltol=0.2, stol=0.3, angle_tol=5, attempt_supercell=True)
-    logger.info("Ready.")
 
-    # ── Checkpoint ────────────────────────────────────────────────────────────
+    # ── Resume support ──────────────────────────────────────────────────────
     done_keys: set = set()
-    if RAW_CSV.exists():
-        prev = pd.read_csv(RAW_CSV)
+    if raw_csv.exists() and not args.no_resume:
+        prev = pd.read_csv(raw_csv)
         done_keys = set(zip(prev["sample_idx"].astype(int), prev["strategy"]))
         logger.info("Resuming: %d rows already done.", len(prev))
+    elif raw_csv.exists() and args.no_resume:
+        raw_csv.unlink()
+        logger.info("Started fresh (--no-resume).")
 
-    raw_rows = []
+    raw_rows: list[dict] = []
 
-    # ── Main benchmark loop ───────────────────────────────────────────────────
-    for loop_i, i in enumerate(range(N_SAMPLES)):
-        tidx    = test_idx[i]
-        mid     = mat_ids[tidx]
-        formula = df.at[tidx, "formula"]
-        true_sg = int(y_sg_raw[tidx])
-        n_el    = int(nelems[tidx])
-        gt_cif  = CIF_DIR / f"{mid}.cif"
+    # ── Main loop ───────────────────────────────────────────────────────────
+    for loop_i, i in enumerate(range(n_take)):
+        tidx     = test_idx[i]
+        mid      = mat_ids[tidx]
+        formula  = df.at[tidx, "formula"]
+        true_sg  = int(y_sg_raw[tidx])
+        n_el     = int(nelems[tidx])
+        gt_cif   = args.cif_dir / f"{mid}.cif"
 
         try:
             gt_struct = Structure.from_file(str(gt_cif))
-            vol_gt    = gt_struct.volume
         except Exception as exc:
-            logger.warning("[%d/%d] GT CIF error %s: %s", loop_i+1, N_SAMPLES, mid, exc)
+            logger.warning("[%d/%d] GT CIF error %s: %s", loop_i + 1, n_take, mid, exc)
             continue
 
-        for strategy in STRATEGIES:
+        for strategy in args.strategies:
             if (i, strategy) in done_keys:
                 continue
 
-            # ── Template retrieval ────────────────────────────────────────────
             S_i = S[i].copy()
-
             if strategy == "sg_only":
-                top_p_enc    = np.argpartition(sg_proba[i], -SG_FILTER_P)[-SG_FILTER_P:]
-                sg_mask      = np.isin(y_sg, top_p_enc)
+                top_p_enc  = np.argpartition(sg_proba[i], -args.k)[-args.k:]
+                sg_mask    = np.isin(y_sg, top_p_enc)
                 S_i[~sg_mask] = -np.inf
                 if not np.any(np.isfinite(S_i)):
                     S_i = S[i].copy()
-
             elif strategy == "sg_ps":
                 ps_mask = build_sg_ps_mask(
-                    sg_proba[i], ps_proba[i], y_sg, y_ps, sg_enc, ps_enc
+                    sg_proba[i], ps_proba[i], y_sg, y_ps, sg_enc, ps_enc, args.sg_ps_top_k,
                 )
                 if ps_mask is not None:
                     S_i[~ps_mask] = -np.inf
-                # else fallback to unconstrained (S_i unchanged)
 
             tmpl_idx = int(np.argmax(S_i))
             tmpl_mid = mat_ids[tmpl_idx]
-            tmpl_cif = CIF_DIR / f"{tmpl_mid}.cif"
+            tmpl_cif = args.cif_dir / f"{tmpl_mid}.cif"
 
             row = dict(
                 sample_idx=i, material_id=mid, formula=formula,
@@ -316,7 +418,6 @@ def main() -> None:
                 relax_sec=float("nan"),
             )
 
-            # ── Substitution ──────────────────────────────────────────────────
             try:
                 tmpl_struct = Structure.from_file(str(tmpl_cif))
                 sub_results = engine.find_substitutions(formula, tmpl_struct)
@@ -330,13 +431,11 @@ def main() -> None:
                 logger.debug("[%d] sub error (%s/%s): %s", i, mid, strategy, exc)
                 raw_rows.append(row); continue
 
-            # ── Relaxation (BFGS + UnitCellFilter, matches AWA paper) ─────────
             relaxed, converged, elapsed, dv = relax_structure(pred_struct, calc, adaptor)
             row["relax_converged"] = converged
             row["relax_sec"]       = round(elapsed, 1)
             row["vol_change"]      = round(float(dv), 4) if not np.isnan(dv) else float("nan")
 
-            # ── Volume-change filter (|ΔV/V| < 15%, same as AWA paper) ────────
             if np.isnan(dv) or dv > VOL_CHANGE_MAX:
                 row["vol_filtered"] = True
                 raw_rows.append(row); continue
@@ -344,90 +443,101 @@ def main() -> None:
             if relaxed is None:
                 raw_rows.append(row); continue
 
-            # ── Structural comparison (all metrics on relaxed structure) ───────
-            compare_struct = relaxed
-            if compare_struct.is_ordered:
-                pred_sg = get_relaxed_sg(compare_struct)
+            if relaxed.is_ordered:
+                pred_sg = get_relaxed_sg(relaxed)
                 if pred_sg is not None:
                     row["sg_match"] = (pred_sg == true_sg)
-                sm_match, rmsd     = sm_compare(gt_struct, compare_struct, matcher)
+                sm_match, rmsd     = sm_compare(gt_struct, relaxed, matcher)
                 row["sm_match"]      = sm_match
                 row["rmsd_angstrom"] = rmsd
 
             raw_rows.append(row)
 
-        # ── Checkpoint ────────────────────────────────────────────────────────
         if raw_rows:
             chunk        = pd.DataFrame(raw_rows)
-            write_header = not RAW_CSV.exists()
-            chunk.to_csv(RAW_CSV, mode="a", header=write_header, index=False)
+            write_header = not raw_csv.exists()
+            chunk.to_csv(raw_csv, mode="a", header=write_header, index=False)
             raw_rows = []
 
-        if (loop_i + 1) % 10 == 0 or loop_i == N_SAMPLES - 1:
-            logger.info("[%d/%d] done", loop_i + 1, N_SAMPLES)
+        if (loop_i + 1) % 10 == 0 or loop_i == n_take - 1:
+            logger.info("[%d/%d] done", loop_i + 1, n_take)
 
-    # ── Aggregate ─────────────────────────────────────────────────────────────
-    raw = pd.read_csv(RAW_CSV)
+    # ── Aggregate + report ──────────────────────────────────────────────────
+    if not raw_csv.exists():
+        logger.warning("No rows written; nothing to aggregate.")
+        return
+    raw = pd.read_csv(raw_csv)
     logger.info("Raw results: %d rows", len(raw))
 
-    def agg(grp):
+    raw["is_valid"] = (
+        raw["sub_success"]
+        & raw["relax_converged"]
+        & (raw["vol_change"] < VOL_CHANGE_MAX)
+    )
+
+    def agg(grp: pd.DataFrame) -> pd.Series:
+        n_total   = len(grp)
+        n_sub     = int(grp["sub_success"].sum())
+        n_valid   = int(grp["is_valid"].sum())
+        valid     = grp[grp["is_valid"]]
         return pd.Series({
-            "n":               len(grp),
-            "sub_success":     grp["sub_success"].mean(),
-            "relax_conv":      grp["relax_converged"].mean(),
-            "vol_filtered":    grp["vol_filtered"].mean(),
-            "sg_match":        grp["sg_match"].mean(),
-            "sm_match":        grp["sm_match"].mean(),
-            "rmsd_median":     grp["rmsd_angstrom"].median(),
+            "n_total":              n_total,
+            "n_sub_success":        n_sub,
+            "n_valid_subset":       n_valid,
+            "sub_success_rate":     n_sub / max(n_total, 1),
+            "sg_match_all":         float(grp["sg_match"].mean()),
+            "sg_match_valid":       float(valid["sg_match"].mean()) if n_valid else float("nan"),
+            "sm_match_all":         float(grp["sm_match"].mean()),
+            "sm_match_valid":       float(valid["sm_match"].mean()) if n_valid else float("nan"),
+            "rmsd_median_valid":    float(valid["rmsd_angstrom"].median()) if n_valid else float("nan"),
         })
 
     agg_overall = raw.groupby("strategy").apply(agg).reset_index()
     agg_nelem   = raw.groupby(["strategy", "n_elements"]).apply(agg).reset_index()
     agg_method  = raw.groupby(["strategy", "sub_method"]).apply(agg).reset_index()
 
-    agg_overall.to_csv(RESULTS_DIR / "benchmark_results.csv",      index=False)
-    agg_nelem.to_csv(  RESULTS_DIR / "benchmark_by_nelements.csv", index=False)
-    agg_method.to_csv( RESULTS_DIR / "benchmark_by_method.csv",    index=False)
+    agg_overall.to_csv(args.output_dir / "benchmark_results.csv",      index=False)
+    agg_nelem.to_csv(  args.output_dir / "benchmark_by_nelements.csv", index=False)
+    agg_method.to_csv( args.output_dir / "benchmark_by_method.csv",    index=False)
 
-    # ── Report ────────────────────────────────────────────────────────────────
     lines = [
-        "# LOO Benchmark Report (Phase 4 — Full Pipeline)\n",
-        f"N={N_SAMPLES}, seed={RANDOM_STATE} | Relaxation: BFGS + UnitCellFilter, "
-        f"fmax={RELAX_FMAX} eV/Å, {RELAX_STEPS} steps, |ΔV/V|<{int(VOL_CHANGE_MAX*100)}% filter\n",
+        "# LOEO Benchmark Report",
+        "",
+        f"n_samples = {args.n_samples}  |  seed = {args.seed}  |  device = {device}",
+        f"strategies = {', '.join(args.strategies)}  |  K (sg_only mask) = {args.k}",
+        f"Relaxation: BFGS + UnitCellFilter, fmax = {RELAX_FMAX} eV/Å, "
+        f"{RELAX_STEPS} steps, |ΔV/V| < {int(VOL_CHANGE_MAX*100)}% valid filter",
+        "",
         "## Overall results",
-        "| Strategy | n | Sub success | Relax conv | Vol filtered | SG match | SM match | RMSD (Å) |",
-        "|---|---|---|---|---|---|---|---|",
+        "",
+        "| Strategy | n_total | sub_success | n_valid | SG match (all 500) | SG match (valid) | SM match (valid) | RMSD median (valid, Å) |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for _, r in agg_overall.iterrows():
         lines.append(
-            f"| {r['strategy']} | {int(r['n'])} "
-            f"| {r['sub_success']:.3f} | {r['relax_conv']:.3f} "
-            f"| {r['vol_filtered']:.3f} | {r['sg_match']:.3f} "
-            f"| {r['sm_match']:.3f} | {r['rmsd_median']:.3f} |"
+            f"| {r['strategy']} | {int(r['n_total'])} "
+            f"| {int(r['n_sub_success'])} ({r['sub_success_rate']*100:.1f}%) "
+            f"| {int(r['n_valid_subset'])} "
+            f"| {r['sg_match_all']*100:.1f}% "
+            f"| {r['sg_match_valid']*100:.1f}% "
+            f"| {r['sm_match_valid']*100:.1f}% "
+            f"| {r['rmsd_median_valid']:.3f} |"
         )
-    lines += ["", "## By n_elements (all strategies)",
-              "| Strategy | n_elements | n | Sub success | SG match | SM match | RMSD (Å) |",
-              "|---|---|---|---|---|---|---|"]
+    lines += ["", "## By number of constituent elements",
+              "",
+              "| Strategy | n_el | n_total | n_valid | SG match (valid) |",
+              "|---|---:|---:|---:|---:|"]
     for _, r in agg_nelem.iterrows():
         lines.append(
-            f"| {r['strategy']} | {int(r['n_elements'])} | {int(r['n'])} "
-            f"| {r['sub_success']:.3f} | {r['sg_match']:.3f} "
-            f"| {r['sm_match']:.3f} | {r['rmsd_median']:.3f} |"
-        )
-    lines += ["", "## By substitution method (sg_ps strategy)",
-              "| Method | n | Relax conv | SG match | SM match | RMSD (Å) |",
-              "|---|---|---|---|---|---|"]
-    for _, r in agg_method[agg_method["strategy"] == "sg_ps"].iterrows():
-        lines.append(
-            f"| {r['sub_method']} | {int(r['n'])} "
-            f"| {r['relax_conv']:.3f} | {r['sg_match']:.3f} "
-            f"| {r['sm_match']:.3f} | {r['rmsd_median']:.3f} |"
+            f"| {r['strategy']} | {int(r['n_elements'])} "
+            f"| {int(r['n_total'])} | {int(r['n_valid_subset'])} "
+            f"| {r['sg_match_valid']*100:.1f}% |"
         )
 
     report = "\n".join(lines) + "\n"
-    (RESULTS_DIR / "benchmark_report.md").write_text(report)
+    (args.output_dir / "benchmark_report.md").write_text(report, encoding="utf-8")
     logger.info("\n%s", report)
-    logger.info("Phase 4 complete. See results/benchmark_report.md")
+    logger.info("Wrote %s", args.output_dir / "benchmark_report.md")
 
 
 if __name__ == "__main__":

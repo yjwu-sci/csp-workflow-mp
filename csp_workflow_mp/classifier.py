@@ -24,13 +24,13 @@ Example
 from __future__ import annotations
 
 import pickle
-from pathlib import Path
 from typing import List, Union
 
 import numpy as np
 
+from csp_workflow_mp._paths import XGB_SG_PKL as _MODEL_PATH
 
-_MODEL_PATH = Path(__file__).parent / "models" / "xgb_sg.pkl"
+
 _CACHE: tuple | None = None
 
 

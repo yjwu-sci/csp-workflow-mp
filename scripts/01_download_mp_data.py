@@ -24,19 +24,34 @@ import os
 import time
 from pathlib import Path
 
+# --- canonical repository paths (see csp_workflow_mp/_paths.py) ---
+import sys as _sys
+_HERE = Path(__file__).resolve().parent
+if str(_HERE.parent) not in _sys.path:
+    _sys.path.insert(0, str(_HERE.parent))
+from csp_workflow_mp._paths import (
+    REPO_ROOT as PROJECT_ROOT,
+    DATA_ROOT,
+    CIF_DIR,
+    METADATA_CSV,
+    METADATA_WITH_DESCRIPTORS_CSV,
+    DESCRIPTORS_NPY,
+    MODEL_DIR,
+    RESULTS_DIR,
+    LOG_DIR,
+    ensure_data_dirs,
+)
+
+ensure_data_dirs()
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler(Path.home() / "csp_mp_data" / "logs" / "download.log"),
+        logging.FileHandler(LOG_DIR / "download.log"),
     ],
 )
 logger = logging.getLogger(__name__)
-
-PROJECT_ROOT = Path(os.environ["PROJECT_ROOT"])
-CIF_DIR      = Path.home() / "csp_mp_data" / "cifs"
-METADATA_CSV = PROJECT_ROOT / "data" / "MP" / "metadata.csv"
 
 METADATA_COLS = [
     "material_id", "formula", "space_group_number",
