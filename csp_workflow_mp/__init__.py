@@ -16,6 +16,7 @@ from csp_workflow_mp.symmetry_filter import (
 from csp_workflow_mp.substitution_engine import SubstitutionEngine
 from csp_workflow_mp.descriptor import compute_periodic_descriptors
 from csp_workflow_mp.retriever import TemplatePool
+from csp_workflow_mp.classifier import predict_top_k_space_groups
 
 __all__ = [
     "RoleGrouping",
@@ -26,4 +27,5 @@ __all__ = [
     "sg_to_pearson_prefix",
     "filter_compatible_pairs",
     "compute_periodic_descriptors",
+    "predict_top_k_space_groups",
 ]

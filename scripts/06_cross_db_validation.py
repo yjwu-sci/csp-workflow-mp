@@ -1,15 +1,30 @@
 """
-Phase 5: Cross-database validation.
+Phase 5: Cross-database validation (AWA).
 
-Apply the MP-trained SG classifier to AWA data to test generalisability.
-AWA descriptors (coef_01..18, prop_01..18) are already in the metadata CSV.
+Applies the MP-trained SG classifier to AtomWork-Adv. (AWA) metadata to
+test generalisability across databases. AWA descriptors
+(coef_01..18, prop_01..18) are already stored in the metadata CSV.
+
+**Not directly runnable from a fresh clone.**
+
+    This script reads ``data/AWA/AWA_metadata_for_benchmark.csv``, which is
+    derived from the AtomWork-Adv. database maintained by NIMS. The AWA
+    database is not publicly redistributable and is therefore NOT included
+    in this repository. The script is kept here for transparency: it is
+    the exact code that produced the aggregated cross-database numbers
+    reported in the Supplementary Information of the paper.
+
+    Readers with NIMS AtomWork-Adv. access may prepare their own AWA
+    metadata CSV in the same schema and re-run this script.
+    Readers without access can trust that this file is what generated the
+    SI cross-DB metrics, but cannot rerun it themselves.
 
 Usage:
     conda activate csp
     python scripts/06_cross_db_validation.py
 
-Input:   data/AWA/AWA_metadata_for_benchmark.csv
-         csp_workflow_mp/models/xgb_sg.pkl
+Input:   data/AWA/AWA_metadata_for_benchmark.csv   (NOT in repo)
+         csp_workflow_mp/models/xgb_sg.pkl         (produced by 03_train_xgboost.py)
 Output:  results/cross_db_results.csv
          results/cross_db_report.md
 """
