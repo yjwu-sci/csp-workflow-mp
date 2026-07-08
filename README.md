@@ -22,7 +22,9 @@ On the leave-one-entry-out benchmark, space-group-guided retrieval raises the sp
 
 ## Installation
 
-The install commands work on macOS, Linux, and Windows PowerShell:
+Any Python 3.10 environment works — the two most common setups are shown below. Pick whichever you prefer.
+
+**Option A — conda (recommended if you already use conda):**
 
 ```bash
 conda create -n csp python=3.10 -y
@@ -30,7 +32,16 @@ conda activate csp
 pip install -e ".[relaxation]"     # keep the quotes — required by zsh
 ```
 
-The `.[relaxation]` extra installs PyTorch and MatterSim, which are needed for the relaxation step. On the first import of MatterSim on Apple Silicon or a CUDA-enabled machine, the appropriate wheel is picked automatically.
+**Option B — the built-in `venv` module (no extra tooling required):**
+
+```bash
+python -m venv .venv
+source .venv/bin/activate          # macOS / Linux (bash, zsh)
+.venv\Scripts\Activate.ps1         # Windows PowerShell
+pip install -e ".[relaxation]"
+```
+
+The `.[relaxation]` extra installs PyTorch and MatterSim, which are needed for the relaxation step. On the first import of MatterSim, the appropriate wheel for your platform (CUDA / Apple Silicon MPS / CPU) is picked automatically.
 
 The pipeline requires a Materials Project API key. It is only used at data-download time (`scripts/01_download_mp_data.py`); the benchmark and prediction paths never touch the network.
 
@@ -114,11 +125,16 @@ feasible = next(r for r in results if r.success)
 predicted = engine.apply_substitution(template_struct, feasible)
 
 # 5. Relax the predicted structure with MatterSim (BFGS + UnitCellFilter).
+#    Auto-select the best available device so this cell works identically
+#    on NVIDIA CUDA machines, Apple Silicon, and CPU-only boxes.
+import torch
+device = ("cuda" if torch.cuda.is_available()
+          else "mps"  if torch.backends.mps.is_available()
+          else "cpu")
+
 adaptor  = AseAtomsAdaptor()
 atoms    = adaptor.get_atoms(predicted)
-atoms.calc = MatterSimCalculator(device="cuda")   # "cuda" for NVIDIA GPU,
-                                                  # "mps"  for Apple Silicon,
-                                                  # "cpu"  otherwise
+atoms.calc = MatterSimCalculator(device=device)
 opt      = BFGS(UnitCellFilter(atoms), logfile=None)
 opt.run(fmax=0.05, steps=500)
 relaxed  = adaptor.get_structure(atoms)
@@ -197,6 +213,51 @@ This work builds on a number of open-source projects. Please cite them when usin
   note   = {manuscript in preparation}
 }
 ```
+
+## Troubleshooting
+
+Common first-run issues, in decreasing order of frequency.
+
+**`RuntimeError: MP_API_KEY not set` on `01_download_mp_data.py`.**
+Set the environment variable in the current shell as shown in the
+[Installation](#installation) section. If you are certain the variable
+is set, verify with `echo $MP_API_KEY` (bash / zsh) or `$env:MP_API_KEY`
+(PowerShell). Keys registered under a different email than the one
+signed into <https://next-gen.materialsproject.org/> will 401.
+
+**`torch` fails to import on Apple Silicon.**
+This is almost always an outdated PyTorch wheel. Upgrade explicitly:
+
+```bash
+pip install --upgrade torch
+python -c "import torch; print(torch.__version__, torch.backends.mps.is_available())"
+```
+
+The second line should print `True` for `mps` availability on Apple Silicon.
+
+**MatterSim downloads its model weights on first use.**
+Expect ~1 GB of network traffic the first time `MatterSimCalculator` is
+instantiated. The weights are cached under `~/.cache/mattersim/`. If you
+are behind a proxy, set `HTTPS_PROXY` before running the notebook.
+
+**`FileNotFoundError: xgb_sg.pkl` when calling `predict_top_k_space_groups`.**
+The classifier is not distributed with the repository (it is 200 MB).
+Regenerate it by completing steps 1–3 of the
+[reproduction pipeline](#reproducing-the-paper-benchmark). The classifier
+file lives at `csp_workflow_mp/models/xgb_sg.pkl` after step 3.
+
+**Long-path errors on Windows.**
+Windows imposes a 260-character path limit unless
+[long paths are enabled](https://learn.microsoft.com/windows/win32/fileio/maximum-file-path-limitation).
+The pipeline itself uses short paths, but the MatterSim cache under a
+deep user profile directory (`C:\Users\<name with spaces>\.cache\...`)
+can hit this on rare configurations. Enabling long paths is the cleanest
+fix.
+
+**`pip install -e ".[relaxation]"` fails with a compiler error.**
+On Linux, install a C compiler first (`apt install build-essential` or
+equivalent). On Windows, install the Visual C++ Build Tools. Most macOS
+systems already ship a working toolchain via the Xcode command-line tools.
 
 ## License
 
