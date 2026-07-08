@@ -55,7 +55,7 @@ logger = logging.getLogger(__name__)
 
 METADATA_COLS = [
     "material_id", "formula", "space_group_number",
-    "pearson_symbol_prefix", "e_above_hull", "nelements",
+    "e_above_hull", "nelements",
 ]
 
 E_HULL_MAX   = 0.1
@@ -77,11 +77,6 @@ def has_excluded_element(formula: str) -> bool:
         return bool({str(e) for e in Composition(formula).elements} & EXCLUDED_ELEMENTS)
     except Exception:
         return True
-
-
-def compute_pearson_prefix(sg_number: int) -> str:
-    from csp_workflow_mp.symmetry_filter import sg_to_pearson_prefix
-    return sg_to_pearson_prefix(sg_number)
 
 
 def download_all() -> None:
@@ -198,12 +193,11 @@ def _write_row(writer, fh, doc, mid: str, existing_in_csv: set) -> None:
     """Append one metadata row and track it."""
     sg  = doc.symmetry.number
     writer.writerow({
-        "material_id":           mid,
-        "formula":               doc.formula_pretty,
-        "space_group_number":    sg,
-        "pearson_symbol_prefix": compute_pearson_prefix(sg),
-        "e_above_hull":          doc.energy_above_hull,
-        "nelements":             doc.nelements,
+        "material_id":        mid,
+        "formula":            doc.formula_pretty,
+        "space_group_number": sg,
+        "e_above_hull":       doc.energy_above_hull,
+        "nelements":          doc.nelements,
     })
     fh.flush()
     existing_in_csv.add(mid)

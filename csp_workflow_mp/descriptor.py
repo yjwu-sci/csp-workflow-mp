@@ -9,7 +9,7 @@ For each of the 18 periodic-table groups, two features are computed:
   - Group property: weighted-average atomic number of elements in that group
 
 This yields a compact, chemically interpretable feature vector suitable
-for XGBoost classification of space group and Pearson symbol.
+for XGBoost classification of the target space group.
 """
 
 from __future__ import annotations

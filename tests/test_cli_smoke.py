@@ -42,12 +42,9 @@ def _no_project_root(monkeypatch):
 
 @pytest.mark.parametrize("name", [
     "01_download_mp_data",
-    "01_download_mp_data_windows",
-    "01b_validate_mp_data",
     "02_compute_descriptors",
     "03_train_xgboost",
     "05_run_benchmark",
-    "05_run_benchmark_windows",
     "06_cross_db_validation",
 ])
 def test_script_imports_without_project_root(name: str):

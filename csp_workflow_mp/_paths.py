@@ -52,7 +52,6 @@ DESCRIPTORS_NPY: Path            = DATA_ROOT / "descriptors.npy"
 # so training and inference never disagree.
 MODEL_DIR: Path                  = PACKAGE_ROOT / "models"
 XGB_SG_PKL: Path                 = MODEL_DIR / "xgb_sg.pkl"
-XGB_PS_PKL: Path                 = MODEL_DIR / "xgb_ps.pkl"
 
 # Benchmark and other pipeline outputs.
 RESULTS_DIR: Path                = _env_path("CSP_RESULTS_DIR",  REPO_ROOT / "results")

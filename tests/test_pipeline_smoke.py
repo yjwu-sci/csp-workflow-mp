@@ -1,13 +1,11 @@
 """End-to-end smoke test: descriptor → tiny TemplatePool → substitution → relax-skip.
 
-This deliberately avoids any dependency on the full MP/AWA databases or on
+This deliberately avoids any dependency on the full MP database or on
 MatterSim — it builds a 3-template synthetic pool inline so it runs in < 1 s
 on any developer machine.
 """
 
-import numpy as np
 import pandas as pd
-import pytest
 from pymatgen.core import Structure, Lattice
 
 import csp_workflow_mp
@@ -15,7 +13,6 @@ from csp_workflow_mp import (
     SubstitutionEngine,
     TemplatePool,
     compute_periodic_descriptors,
-    sg_to_pearson_prefix,
 )
 
 
@@ -36,11 +33,11 @@ def _build_tiny_pool(tmp_path):
     cif_dir.mkdir()
 
     specs = [
-        ("syn-001", "NaCl",  225, "cF", "Na", "Cl"),
-        ("syn-002", "KCl",   225, "cF", "K",  "Cl"),
-        ("syn-003", "MgO",   225, "cF", "Mg", "O"),
+        ("syn-001", "NaCl", 225, "Na", "Cl"),
+        ("syn-002", "KCl",  225, "K",  "Cl"),
+        ("syn-003", "MgO",  225, "Mg", "O"),
     ]
-    for mid, formula, sg, ps, cation, anion in specs:
+    for mid, formula, sg, cation, anion in specs:
         struct = Structure(Lattice.cubic(4.2), [cation, anion],
                            [[0, 0, 0], [0.5, 0.5, 0.5]])
         cif_path = cif_dir / f"{mid}.cif"
@@ -50,11 +47,10 @@ def _build_tiny_pool(tmp_path):
             "material_id": mid,
             "formula": formula,
             "space_group": sg,
-            "pearson_prefix": ps,
             "cif_path": cif_path.name,
         }
-        row.update({f"coef_{i:02d}": desc[i - 1]      for i in range(1, 19)})
-        row.update({f"prop_{i:02d}": desc[17 + i]     for i in range(1, 19)})
+        row.update({f"coef_{i:02d}": desc[i - 1]  for i in range(1, 19)})
+        row.update({f"prop_{i:02d}": desc[17 + i] for i in range(1, 19)})
         rows.append(row)
     return pd.DataFrame(rows), cif_dir
 
@@ -66,24 +62,22 @@ def test_end_to_end_synthetic_pipeline(tmp_path):
     pool = TemplatePool(metadata, cif_root=cif_dir)
     assert len(pool) == 3
 
-    # 2) Symmetry filter agrees with the SG=225 templates.
-    assert sg_to_pearson_prefix(225) == "cF"
-
-    # 3) Substitute KBr (not in pool) onto the closest template.
+    # 2) Retrieve descriptor-nearest template restricted to SG = 225.
     target_desc = compute_periodic_descriptors("KBr")
     hits = pool.search(
         space_group=225,
-        pearson_prefix="cF",
         descriptor_vector=target_desc,
         top_n=3,
     )
     assert len(hits) >= 1
-    # 4) Try substitution on the top hit.
+
+    # 3) Substitute KBr (not in pool) onto the top hit.
     top = hits.iloc[0]
     template_struct = Structure.from_file(str(cif_dir / f"{top['material_id']}.cif"))
     engine = SubstitutionEngine()
     results = engine.find_substitutions("KBr", template_struct)
     assert any(r.success for r in results)
-    pred = engine.apply_substitution(template_struct,
-                                     next(r for r in results if r.success))
+    pred = engine.apply_substitution(
+        template_struct, next(r for r in results if r.success)
+    )
     assert {s.species_string for s in pred} == {"K", "Br"}

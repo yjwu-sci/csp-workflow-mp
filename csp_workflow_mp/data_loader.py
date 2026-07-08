@@ -31,20 +31,17 @@ def load_mp_metadata(metadata_path: str | Path) -> pd.DataFrame:
     Load MP metadata CSV produced by scripts/01_download_mp_data.py.
 
     Expected columns: material_id, formula, space_group_number,
-    pearson_symbol_prefix, e_above_hull, nelements.
+    e_above_hull, nelements.
     """
     df = pd.read_csv(metadata_path)
 
-    required = {"material_id", "formula", "space_group_number", "pearson_symbol_prefix"}
+    required = {"material_id", "formula", "space_group_number"}
     missing = required - set(df.columns)
     if missing:
         raise ValueError(f"MP metadata missing columns: {missing}")
 
     # Normalize to the column names TemplatePool expects
-    df = df.rename(columns={
-        "space_group_number": "space_group",
-        "pearson_symbol_prefix": "pearson_prefix",
-    })
+    df = df.rename(columns={"space_group_number": "space_group"})
 
     logger.info("Loaded %d MP entries from %s", len(df), metadata_path)
     return df

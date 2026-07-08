@@ -1,15 +1,9 @@
-"""Smoke tests for SubstitutionEngine + symmetry filter."""
+"""Smoke tests for SubstitutionEngine + formula parsing."""
 
-import numpy as np
 import pytest
 from pymatgen.core import Structure, Lattice
 
-from csp_workflow_mp import (
-    SubstitutionEngine,
-    sg_to_pearson_prefix,
-    is_valid_combination,
-    allowed_pearson_set,
-)
+from csp_workflow_mp import SubstitutionEngine
 from csp_workflow_mp.substitution_engine import parse_formula
 
 
@@ -34,34 +28,6 @@ def test_parse_formula_fractional():
     elems = parse_formula("Li6.5La3Zr1.5Ta0.5O12")
     assert elems["Li"] == pytest.approx(6.5)
     assert elems["Ta"] == pytest.approx(0.5)
-
-
-# ---------------------------------------------------------------- symmetry filter
-
-
-@pytest.mark.parametrize("sg,expected", [
-    (1,   "aP"),    # triclinic
-    (14,  "mP"),    # monoclinic P
-    (62,  "oP"),    # orthorhombic P
-    (139, "tI"),    # tetragonal I
-    (166, "hR"),    # trigonal R
-    (194, "hP"),    # hexagonal P
-    (225, "cF"),    # cubic F (NaCl)
-    (229, "cI"),    # cubic I
-])
-def test_sg_to_pearson_canonical(sg, expected):
-    assert sg_to_pearson_prefix(sg) == expected
-
-
-def test_is_valid_combination():
-    assert is_valid_combination(225, "cF") is True
-    assert is_valid_combination(225, "cP") is False
-
-
-def test_allowed_pearson_set_cubic():
-    # The deprecated multi-prefix function should accept all three cubic centerings for SG=225.
-    s = allowed_pearson_set(225)
-    assert {"cP", "cI", "cF"}.issubset(s)
 
 
 # ---------------------------------------------------------------- SubstitutionEngine

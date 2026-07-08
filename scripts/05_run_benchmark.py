@@ -35,7 +35,6 @@ Inputs
     data/MP/metadata_with_descriptors.csv
     data/MP/cifs/{mp-id}.cif                   (or $CSP_MP_CIF_DIR)
     csp_workflow_mp/models/xgb_sg.pkl          (produced by 03_train_xgboost.py)
-    csp_workflow_mp/models/xgb_ps.pkl          (only if --strategy sg_ps)
 
 Outputs (under --output-dir, default: results/)
     benchmark_raw.csv
@@ -73,7 +72,6 @@ from csp_workflow_mp._paths import (      # noqa: E402
     ensure_data_dirs,
 )
 from csp_workflow_mp.substitution_engine import SubstitutionEngine   # noqa: E402
-from csp_workflow_mp.symmetry_filter import filter_compatible_pairs  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -89,7 +87,7 @@ RELAX_STEPS    = 500
 RELAX_TIMEOUT  = 300         # seconds per structure
 VOL_CHANGE_MAX = 0.15        # |ΔV/V| < 15%
 
-ALL_STRATEGIES = ["unconstrained", "sg_only", "sg_ps"]
+ALL_STRATEGIES = ["unconstrained", "sg_only"]
 
 
 # ─────────────────────── CLI ────────────────────────────────────────────────
@@ -112,10 +110,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--unconstrained", action="store_true",
         help="Shortcut for --strategy unconstrained.",
-    )
-    p.add_argument(
-        "--sg-ps-top-k", type=int, default=5,
-        help="Top-K for the SG×PS compatibility filter (only used by strategy sg_ps).",
     )
     p.add_argument(
         "--n-samples", type=int, default=500,
@@ -250,30 +244,6 @@ def get_relaxed_sg(structure) -> int | None:
         return None
 
 
-def build_sg_ps_mask(
-    sg_proba_i, ps_proba_i, y_sg, y_ps_enc, sg_enc, ps_enc, top_k: int,
-):
-    top_k_sg_enc = np.argpartition(sg_proba_i, -top_k)[-top_k:]
-    top_k_ps_enc = np.argpartition(ps_proba_i, -top_k)[-top_k:]
-
-    sg_preds = [(int(sg_enc.inverse_transform([e])[0]), float(sg_proba_i[e]))
-                for e in top_k_sg_enc]
-    ps_preds = [(str(ps_enc.inverse_transform([e])[0]).strip(), float(ps_proba_i[e]))
-                for e in top_k_ps_enc]
-
-    compatible = filter_compatible_pairs(sg_preds, ps_preds, top_n=25)
-    if not compatible:
-        return None
-
-    sg_raw_arr = np.array([int(sg_enc.inverse_transform([e])[0]) for e in y_sg])
-    ps_raw_arr = np.array([str(ps_enc.inverse_transform([e])[0]).strip() for e in y_ps_enc])
-
-    mask = np.zeros(len(y_sg), dtype=bool)
-    for sg, ps, _ in compatible:
-        mask |= (sg_raw_arr == sg) & (ps_raw_arr == ps)
-    return mask if mask.any() else None
-
-
 # ─────────────────────── main ───────────────────────────────────────────────
 
 def main() -> None:
@@ -296,40 +266,27 @@ def main() -> None:
     logger.info("Loaded %d rows", len(df))
 
     sg_col = "space_group" if "space_group" in df.columns else "space_group_number"
-    ps_col = "pearson_symbol_prefix" if "pearson_symbol_prefix" in df.columns else "pearson_prefix"
 
     X        = df[DESC_COLS].to_numpy(dtype=np.float32)
     y_sg_raw = df[sg_col].values
-    y_ps_raw = df[ps_col].values.astype(str) if ps_col in df.columns else None
     mat_ids  = df["material_id"].values
     nelems   = df["nelements"].values if "nelements" in df.columns else np.ones(len(df), int)
 
-    # ── Load classifiers ────────────────────────────────────────────────────
+    # ── Load classifier ─────────────────────────────────────────────────────
     with open(args.model_dir / "xgb_sg.pkl", "rb") as f:
         sg_pkg = pickle.load(f)
     sg_model, sg_enc = sg_pkg["model"], sg_pkg["encoder"]
-
-    if "sg_ps" in args.strategies:
-        with open(args.model_dir / "xgb_ps.pkl", "rb") as f:
-            ps_pkg = pickle.load(f)
-        ps_model, ps_enc = ps_pkg["model"], ps_pkg["encoder"]
-    else:
-        ps_model = ps_enc = None
 
     logger.info("SG classes: %d", len(sg_enc.classes_))
 
     # ── Filter to classes seen during training ──────────────────────────────
     known_mask = np.isin(y_sg_raw, sg_enc.classes_)
-    if ps_enc is not None:
-        known_mask &= np.isin(y_ps_raw, ps_enc.classes_)
     df       = df[known_mask].reset_index(drop=True)
     X        = X[known_mask]
     y_sg_raw = y_sg_raw[known_mask]
-    y_ps_raw = y_ps_raw[known_mask] if y_ps_raw is not None else None
     mat_ids  = mat_ids[known_mask]
     nelems   = nelems[known_mask]
     y_sg     = sg_enc.transform(y_sg_raw).astype(np.int32)
-    y_ps     = ps_enc.transform(y_ps_raw).astype(np.int32) if ps_enc is not None else None
 
     # ── Sample targets ──────────────────────────────────────────────────────
     rng      = np.random.default_rng(args.seed)
@@ -346,8 +303,7 @@ def main() -> None:
         S[i, idx] = -np.inf
 
     # ── Classifier probabilities on targets ─────────────────────────────────
-    sg_proba = sg_model.predict_proba(X[test_idx]) if "sg_only" in args.strategies or "sg_ps" in args.strategies else None
-    ps_proba = ps_model.predict_proba(X[test_idx]) if "sg_ps" in args.strategies else None
+    sg_proba = sg_model.predict_proba(X[test_idx]) if "sg_only" in args.strategies else None
 
     # ── Load MatterSim, adaptor, substitution engine ────────────────────────
     logger.info("Loading MatterSim on device=%s ...", device)
@@ -396,12 +352,6 @@ def main() -> None:
                 S_i[~sg_mask] = -np.inf
                 if not np.any(np.isfinite(S_i)):
                     S_i = S[i].copy()
-            elif strategy == "sg_ps":
-                ps_mask = build_sg_ps_mask(
-                    sg_proba[i], ps_proba[i], y_sg, y_ps, sg_enc, ps_enc, args.sg_ps_top_k,
-                )
-                if ps_mask is not None:
-                    S_i[~ps_mask] = -np.inf
 
             tmpl_idx = int(np.argmax(S_i))
             tmpl_mid = mat_ids[tmpl_idx]
