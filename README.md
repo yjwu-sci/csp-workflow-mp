@@ -29,7 +29,7 @@ Any Python 3.10 environment works — the two most common setups are shown below
 ```bash
 conda create -n csp python=3.10 -y
 conda activate csp
-pip install -e ".[relaxation]"     # keep the quotes — required by zsh
+pip install -e ".[relaxation,dev]"     # keep the quotes — required by zsh
 ```
 
 **Option B — the built-in `venv` module (no extra tooling required):**
@@ -38,10 +38,10 @@ pip install -e ".[relaxation]"     # keep the quotes — required by zsh
 python -m venv .venv
 source .venv/bin/activate          # macOS / Linux (bash, zsh)
 .venv\Scripts\Activate.ps1         # Windows PowerShell
-pip install -e ".[relaxation]"
+pip install -e ".[relaxation,dev]"
 ```
 
-The `.[relaxation]` extra installs PyTorch and MatterSim, which are needed for the relaxation step. On the first import of MatterSim, the appropriate wheel for your platform (CUDA / Apple Silicon MPS / CPU) is picked automatically.
+The `.[relaxation]` extra installs PyTorch and MatterSim, which are needed for the relaxation step. On the first import of MatterSim, the appropriate wheel for your platform (CUDA / Apple Silicon MPS / CPU) is picked automatically. The `.[dev]` extra adds `pytest` and Jupyter so the test suite and notebooks run out of the box.
 
 The pipeline requires a Materials Project API key. It is only used at data-download time (`scripts/01_download_mp_data.py`); the benchmark and prediction paths never touch the network.
 
