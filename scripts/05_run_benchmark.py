@@ -4,18 +4,27 @@ LOEO benchmark on Materials Project.
 For each target sampled from the MP pool the pipeline is:
   1. Exclude the target's own material_id from the template pool
      (leave-one-entry-out).
-  2. Retrieve the top template by descriptor cosine similarity, subject
-     to the strategy's SG mask (or no mask for the unconstrained case).
-  3. Attempt a chemical-role substitution onto the retrieved template.
-  4. Relax the substituted structure with MatterSim (BFGS + UnitCellFilter,
-     fmax = 0.05 eV/Å, up to 500 steps; timeout 300 s).
+  2. Rank all remaining templates by descriptor cosine similarity,
+     subject to the strategy's SG mask (or no mask for the
+     unconstrained case).
+  3. Attempt a chemical-role substitution on the ranked templates in
+     order until the first success (up to --n-retry templates, default
+     50; matches the paper's rank-order retry policy). The template
+     rank that succeeded is written to the raw CSV as `template_rank`
+     (0 = top-1; -1 = all candidates failed).
+  4. Relax the substituted structure with MatterSim (BFGS +
+     UnitCellFilter, fmax = 0.05 eV/Å, up to 500 steps; timeout 300 s).
+     Disordered candidates are not relaxed; they are counted as
+     substitution failures on the valid subset.
   5. Apply the |ΔV/V| < 15% valid-subset filter.
   6. Compare the relaxed structure against ground truth:
        * SpacegroupAnalyzer → sg_match
        * StructureMatcher   → sm_match + rmsd_angstrom
 
 The script writes a per-target raw CSV, three aggregated CSVs, and a
-Markdown report.
+Markdown report. Aggregated SG match / SM match / RMSD are computed on
+the valid subset (substitution succeeded AND relax converged AND
+|ΔV/V| < 15%), matching the paper's Table 2 and Table 3 definition.
 
 Basic usage
 -----------
@@ -24,11 +33,7 @@ Basic usage
     python scripts/05_run_benchmark.py                   # all strategies
     python scripts/05_run_benchmark.py --k 1             # SG-guided, K=1
     python scripts/05_run_benchmark.py --unconstrained   # unconstrained only
-
-For every retrieval strategy the aggregated report exposes both the
-all-500-target denominator and the valid-subset denominator, so the
-paper numbers (31.2% and 57.5% on the valid subset) can be
-recomputed from the raw CSV without any post-processing.
+    python scripts/05_run_benchmark.py --n-retry 50      # rank-order retry width
 
 Inputs
 ------
@@ -37,7 +42,7 @@ Inputs
     csp_workflow_mp/models/xgb_sg.pkl          (produced by 03_train_xgboost.py)
 
 Outputs (under --output-dir, default: results/)
-    benchmark_raw.csv
+    benchmark_raw.csv           # includes template_rank column
     benchmark_results.csv
     benchmark_by_nelements.csv
     benchmark_by_method.csv
@@ -72,6 +77,11 @@ from csp_workflow_mp._paths import (      # noqa: E402
     ensure_data_dirs,
 )
 from csp_workflow_mp.substitution_engine import SubstitutionEngine   # noqa: E402
+
+# structural_eval_helpers ships alongside this script (scripts/).
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
+from structural_eval_helpers import soap_cosine_similarity   # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -142,6 +152,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--no-resume", action="store_true",
         help="Ignore any existing benchmark_raw.csv and start from scratch.",
+    )
+    p.add_argument(
+        "--n-retry", type=int, default=50,
+        help="Number of top-ranked templates to try in rank order until a substitution "
+             "succeeds. Paper default: 50. Set to 1 to reproduce the argmax-only "
+             "behaviour of pre-2026-07 versions.",
     )
     args = p.parse_args()
 
@@ -255,7 +271,8 @@ def main() -> None:
 
     logger.info("Strategies: %s", args.strategies)
     logger.info("K = %d (sg_only mask width)", args.k)
-    logger.info("n_samples = %d, seed = %d, device = %s", args.n_samples, args.seed, device)
+    logger.info("n_samples = %d, seed = %d, n_retry = %d, device = %s",
+                args.n_samples, args.seed, args.n_retry, device)
     logger.info("Data:   %s", args.data_csv)
     logger.info("CIFs:   %s", args.cif_dir)
     logger.info("Model:  %s", args.model_dir)
@@ -289,9 +306,14 @@ def main() -> None:
     y_sg     = sg_enc.transform(y_sg_raw).astype(np.int32)
 
     # ── Sample targets ──────────────────────────────────────────────────────
-    rng      = np.random.default_rng(args.seed)
-    n_take   = min(args.n_samples, len(df))
-    test_idx = rng.choice(len(df), size=n_take, replace=False)
+    # Paper convention: draw the canonical 500 samples first, then take the
+    # first n_samples. This keeps subsampling stable — --n-samples 20 uses the
+    # same first 20 targets that would appear at the start of a 500-sample run.
+    rng           = np.random.default_rng(args.seed)
+    canonical_n   = 500
+    n_take        = min(args.n_samples, canonical_n, len(df))
+    full_draw     = rng.choice(len(df), size=min(canonical_n, len(df)), replace=False)
+    test_idx      = full_draw[:n_take]
 
     # ── Descriptor similarity matrix ────────────────────────────────────────
     norms  = np.linalg.norm(X, axis=1, keepdims=True)
@@ -353,32 +375,63 @@ def main() -> None:
                 if not np.any(np.isfinite(S_i)):
                     S_i = S[i].copy()
 
-            tmpl_idx = int(np.argmax(S_i))
-            tmpl_mid = mat_ids[tmpl_idx]
-            tmpl_cif = args.cif_dir / f"{tmpl_mid}.cif"
+            # Top-N ranked candidates for rank-order retry.
+            finite_count = int(np.isfinite(S_i).sum())
+            top_n = min(args.n_retry, finite_count)
 
             row = dict(
                 sample_idx=i, material_id=mid, formula=formula,
                 n_elements=n_el, true_sg=true_sg, strategy=strategy,
-                template_id=tmpl_mid,
+                template_id="", template_rank=-1,
                 sub_success=False, sub_method="none",
                 relax_converged=False, vol_change=float("nan"),
                 vol_filtered=False,
                 sg_match=False, sm_match=False, rmsd_angstrom=float("nan"),
+                soap_cosine=float("nan"),
                 relax_sec=float("nan"),
             )
 
+            if top_n == 0:
+                raw_rows.append(row); continue
+
+            # argpartition returns unordered top-N; sort them descending.
+            cand_idx_unsorted = np.argpartition(S_i, -top_n)[-top_n:]
+            cand_idx = cand_idx_unsorted[np.argsort(-S_i[cand_idx_unsorted])]
+
+            # Rank-order substitution: iterate until first success.
+            sub_res = None
+            tmpl_struct = None
+            for rank, c_idx in enumerate(cand_idx):
+                if not np.isfinite(S_i[c_idx]):
+                    continue
+                c_mid = mat_ids[c_idx]
+                c_cif = args.cif_dir / f"{c_mid}.cif"
+                try:
+                    cs = Structure.from_file(str(c_cif))
+                    sr = engine.find_substitutions(formula, cs)
+                    sr_first = next((r for r in sr if r.success), None)
+                    if sr_first is not None:
+                        sub_res = sr_first
+                        tmpl_struct = cs
+                        row["template_id"] = c_mid
+                        row["template_rank"] = rank
+                        row["sub_success"] = True
+                        row["sub_method"] = sub_res.method or "unknown"
+                        break
+                except Exception as exc:
+                    logger.debug("[%d] rank=%d sub error (%s/%s/tmpl=%s): %s",
+                                 i, rank, mid, strategy, c_mid, exc)
+                    continue
+
+            if sub_res is None:
+                # all top_n candidates failed
+                raw_rows.append(row); continue
+
             try:
-                tmpl_struct = Structure.from_file(str(tmpl_cif))
-                sub_results = engine.find_substitutions(formula, tmpl_struct)
-                sub_res     = next((r for r in sub_results if r.success), None)
-                if sub_res is None:
-                    raw_rows.append(row); continue
-                pred_struct        = engine.apply_substitution(tmpl_struct, sub_res)
-                row["sub_success"] = True
-                row["sub_method"]  = sub_res.method or "unknown"
+                pred_struct = engine.apply_substitution(tmpl_struct, sub_res)
             except Exception as exc:
-                logger.debug("[%d] sub error (%s/%s): %s", i, mid, strategy, exc)
+                logger.debug("[%d] apply_substitution error (%s/%s): %s",
+                             i, mid, strategy, exc)
                 raw_rows.append(row); continue
 
             relaxed, converged, elapsed, dv = relax_structure(pred_struct, calc, adaptor)
@@ -400,6 +453,16 @@ def main() -> None:
                 sm_match, rmsd     = sm_compare(gt_struct, relaxed, matcher)
                 row["sm_match"]      = sm_match
                 row["rmsd_angstrom"] = rmsd
+
+            # SOAP cosine similarity between predicted (relaxed) and ground truth.
+            # Uses dominant-species ordering internally to handle partial-occ
+            # references. Optional — soap_cosine=NaN if dscribe unavailable.
+            try:
+                soap_val = soap_cosine_similarity(relaxed, gt_struct)
+                if soap_val is not None:
+                    row["soap_cosine"] = round(float(soap_val), 6)
+            except Exception as exc:
+                logger.debug("[%d] SOAP error (%s/%s): %s", i, mid, strategy, exc)
 
             raw_rows.append(row)
 

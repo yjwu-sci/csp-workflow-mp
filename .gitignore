@@ -33,7 +33,10 @@ csp_workflow_mp/models/*.joblib
 
 # Results (too large for Git; archived on Zenodo)
 results/
-results_windows_*/
+results_*/
+
+# Local backups from bug-fix / refactor cycles
+*.bak
 
 # Local archive directories (not for GitHub)
 _archive_logs/

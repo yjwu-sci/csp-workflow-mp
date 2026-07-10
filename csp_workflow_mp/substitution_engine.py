@@ -114,9 +114,19 @@ def parse_formula(formula: str) -> Dict[str, float]:
     """
     Parse a chemical formula string into {element: count}.
 
-    Supports integer and decimal stoichiometry, e.g.:
-    - ``"Li3PO4"``    → ``{"Li": 3.0, "P": 1.0, "O": 4.0}``
-    - ``"Li6.5La3Zr1.5Ta0.5O12"`` → ...
+    Delegates to pymatgen.core.Composition to correctly handle
+    parenthesised groups, decimal stoichiometry, and hydrate-style
+    formulas. Examples::
+
+        "Li3PO4"                → {"Li": 3.0, "P": 1.0, "O": 4.0}
+        "MgP2(H8O5)2"           → {"Mg": 1.0, "P": 2.0, "H": 16.0, "O": 10.0}
+        "Li6.5La3Zr1.5Ta0.5O12" → {"Li": 6.5, "La": 3.0, ...}
+
+    Historical note: an earlier regex-based implementation silently
+    dropped parenthesised outer multipliers, which caused
+    misparsed target compositions to trigger the substitution engine's
+    fallback path and produce misleading "fake successes" in the
+    benchmark. See commit history for details.
 
     Parameters
     ----------
@@ -126,16 +136,8 @@ def parse_formula(formula: str) -> Dict[str, float]:
     -------
     dict of {str: float}
     """
-    import re
-    pattern = r"([A-Z][a-z]?)(\d*\.?\d*)"
-    matches = re.findall(pattern, formula)
-    result = {}
-    for elem, count_str in matches:
-        if not elem:
-            continue
-        count = float(count_str) if count_str else 1.0
-        result[elem] = result.get(elem, 0.0) + count
-    return result
+    from pymatgen.core import Composition
+    return {str(elem): float(count) for elem, count in Composition(formula).as_dict().items()}
 
 
 # ============================================================================
@@ -1002,15 +1004,20 @@ class SubstitutionEngine:
                 r.issues = (r.issues or []) + extra_issues
 
         if not results:
-            # Last resort: mixed occupancy for all sites
+            # When all assignment solvers fail, we cannot produce a valid
+            # substituted structure. Previously this returned success=True with
+            # an empty mapping, which caused apply_substitution to return the
+            # unchanged template (a silent "fake success"). Return
+            # success=False so the caller's retry loop moves on to the next
+            # candidate template.
             results = [SubstitutionResult(
-                success=True,
+                success=False,
                 target_formula=target_formula,
                 template_formula=template_formula,
                 z_factor=z_factor,
                 method=method_prefix + "mixed_occupancy",
-                score=0.3 if method_prefix else 0.5,
-                issues=(extra_issues or []) + ["Fallback to uniform mixed occupancy"],
+                score=0.0,
+                issues=(extra_issues or []) + ["All assignment solvers failed; no substitution produced."],
             )]
 
         # Score results
