@@ -52,9 +52,18 @@ result = predict_from_formula('BaFe0.5Mn0.5O3', known_sg=221, do_relax=True)
 # See notebooks/03_partial_occupancy_handling.ipynb for details.
 ```
 
-`PredictionResult` fields include: `status` (SUCCESS / SUBSTITUTED_ONLY / PARTIAL_OCCUPANCY / SUBSTITUTION_FAILED / RELAX_FAILED / NO_CANDIDATE), `template_material_id`, `template_rank`, `substituted_structure`, `relaxed_structure`, `warnings`, and paths to any CIFs written to `output_dir`.
+The returned `PredictionResult` reports the retrieved template, saved CIF paths, warnings, and a `status` field:
 
-For the low-level 5-step pipeline (descriptor → classifier → retrieval → substitution → relaxation) and per-step diagnostics, see `notebooks/01_predict_composition_example.ipynb` sections 1–7.
+| `status` | meaning |
+|---|---|
+| `SUCCESS` | substitution and relaxation both succeeded; \|ΔV/V\| < 15% |
+| `SUBSTITUTED_ONLY` | substitution succeeded, relaxation skipped (`do_relax=False`) |
+| `PARTIAL_OCCUPANCY` | substituted structure is disordered; CIF saved, relaxation skipped |
+| `RELAX_FAILED` | relaxation did not converge or \|ΔV/V\| exceeded 15% |
+| `SUBSTITUTION_FAILED` | no feasible mapping found in the top-N templates |
+| `NO_CANDIDATE` | template pool had no entries matching the requested SG |
+
+For a step-by-step walk-through of the pipeline (descriptor → classifier → template retrieval → substitution → relaxation) with per-step diagnostics, see `notebooks/01_predict_composition_example.ipynb`.
 
 **Out of scope**: highly complex hypothetical compositions (many elements with fractional stoichiometry, e.g., glass-electrolyte-like) are template-poor by construction and typically return `SUBSTITUTION_FAILED`.
 
