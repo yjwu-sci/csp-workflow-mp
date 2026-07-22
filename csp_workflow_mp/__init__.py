@@ -12,6 +12,7 @@ from csp_workflow_mp.substitution_engine import SubstitutionEngine
 from csp_workflow_mp.descriptor import compute_periodic_descriptors
 from csp_workflow_mp.retriever import TemplatePool
 from csp_workflow_mp.classifier import predict_top_k_space_groups
+from csp_workflow_mp.predict import predict_from_formula, PredictionResult
 
 __all__ = [
     "RoleGrouping",
@@ -19,4 +20,6 @@ __all__ = [
     "TemplatePool",
     "compute_periodic_descriptors",
     "predict_top_k_space_groups",
+    "predict_from_formula",
+    "PredictionResult",
 ]

@@ -22,9 +22,11 @@ For each target sampled from the MP pool the pipeline is:
        * StructureMatcher   → sm_match + rmsd_angstrom
 
 The script writes a per-target raw CSV, three aggregated CSVs, and a
-Markdown report. Aggregated SG match / SM match / RMSD are computed on
-the valid subset (substitution succeeded AND relax converged AND
-|ΔV/V| < 15%), matching the paper's Table 2 and Table 3 definition.
+Markdown report. Aggregated SG match / RMSD are computed on the valid
+subset (substitution succeeded AND relax converged AND |ΔV/V| < 15%),
+matching the paper's Table 2 and Table 3 definition. The `sm_match`
+column is retained in benchmark_raw.csv for post-hoc analysis but is
+not aggregated or reported (not a paper metric).
 
 Basic usage
 -----------
@@ -243,8 +245,13 @@ def sm_compare(s1, s2, matcher):
         match = matcher.fit(s1, s2)
         if match:
             rms, _ = matcher.get_rms_dist(s1, s2)
-            avg_a  = (s1.lattice.a + s2.lattice.a) / 2
-            return True, float(rms) * avg_a
+            # pymatgen's get_rms_dist returns rms displacement normalized by
+            # (Vol / nsites)**(1/3); multiply back by the mean per-atom length
+            # scale of the two structures to report RMSD in Å (the standard
+            # pymatgen convention).
+            scale = ((s1.volume / len(s1)) ** (1/3)
+                     + (s2.volume / len(s2)) ** (1/3)) / 2
+            return True, float(rms) * scale
         return False, float("nan")
     except Exception:
         return False, float("nan")
@@ -493,8 +500,10 @@ def main() -> None:
 
         All rates are computed on the valid subset (relaxation converged AND
         |ΔV/V| < 15%), matching the definition used throughout the paper:
-        SG match / SM match / RMSD numbers appearing in the manuscript are
-        exactly these fractions.
+        SG match and RMSD numbers appearing in the manuscript are exactly
+        these fractions. The `sm_match` column remains in benchmark_raw.csv
+        for any post-hoc analysis but is not aggregated into the paper's
+        primary metrics.
         """
         n_total = len(grp)
         n_sub   = int(grp["sub_success"].sum())
@@ -506,7 +515,6 @@ def main() -> None:
             "n_valid_subset":   n_valid,
             "sub_success_rate": n_sub / max(n_total, 1),
             "sg_match":         float(valid["sg_match"].mean())         if n_valid else float("nan"),
-            "sm_match":         float(valid["sm_match"].mean())         if n_valid else float("nan"),
             "rmsd_median":      float(valid["rmsd_angstrom"].median())  if n_valid else float("nan"),
         })
 
@@ -526,13 +534,13 @@ def main() -> None:
         f"Relaxation: BFGS + UnitCellFilter, fmax = {RELAX_FMAX} eV/Å, "
         f"{RELAX_STEPS} steps, |ΔV/V| < {int(VOL_CHANGE_MAX*100)}% valid filter",
         "",
-        "SG match, SM match, and RMSD are computed on the valid subset "
+        "SG match and RMSD are computed on the valid subset "
         "(substitution succeeded, relaxation converged, and |ΔV/V| < 15%).",
         "",
         "## Overall results",
         "",
-        "| Strategy | n_total | sub_success | n_valid | SG match | SM match | RMSD median (Å) |",
-        "|---|---:|---:|---:|---:|---:|---:|",
+        "| Strategy | n_total | sub_success | n_valid | SG match | RMSD median (Å) |",
+        "|---|---:|---:|---:|---:|---:|",
     ]
     for _, r in agg_overall.iterrows():
         lines.append(
@@ -540,7 +548,6 @@ def main() -> None:
             f"| {int(r['n_sub_success'])} ({r['sub_success_rate']*100:.1f}%) "
             f"| {int(r['n_valid_subset'])} "
             f"| {r['sg_match']*100:.1f}% "
-            f"| {r['sm_match']*100:.1f}% "
             f"| {r['rmsd_median']:.3f} |"
         )
     lines += ["", "## By number of constituent elements",

@@ -33,25 +33,30 @@ $env:MP_API_KEY="your_key"     # PowerShell
 
 ## Quick start
 
-Predict a structure for one composition (KTaO₃ shown). Full recipe in `notebooks/01_predict_new_composition.ipynb`:
+Predict a structure from a formula in one call. Full runnable example in `notebooks/01_predict_composition_example.ipynb`:
 
 ```python
-from csp_workflow_mp import compute_periodic_descriptors, predict_top_k_space_groups, TemplatePool, SubstitutionEngine
-from pymatgen.core import Structure
+from csp_workflow_mp import predict_from_formula
 
-formula = "KTaO3"
-desc    = compute_periodic_descriptors(formula)
-top_sg  = predict_top_k_space_groups(desc, k=1)[0]
+# Case 1: standard — let the XGBoost classifier pick the space group
+result = predict_from_formula('KTaO3', top_k_sg=1, do_relax=True)
+print(result.summary())
 
-pool = TemplatePool("data/MP/metadata_with_descriptors.csv", cif_root="data/MP/cifs")
-hit  = pool.search(space_group=top_sg, descriptor_vector=desc, top_n=1).iloc[0]
-tmpl = Structure.from_file(f"data/MP/cifs/{hit['material_id']}.cif")
+# Case 2: user already knows the space group (XRD / Rietveld / literature)
+result = predict_from_formula('KTaO3', known_sg=221, do_relax=True)
 
-engine   = SubstitutionEngine()
-sub      = next(r for r in engine.find_substitutions(formula, tmpl) if r.success)
-predicted = engine.apply_substitution(tmpl, sub)
-# → relax with MatterSim (see notebook for the ~10-line relaxation block)
+# Case 3: target with fractional stoichiometry (partial-occupancy handling)
+result = predict_from_formula('BaFe0.5Mn0.5O3', known_sg=221, do_relax=True)
+# → result.status == 'PARTIAL_OCCUPANCY'; substituted CIF is saved to disk,
+#   MatterSim relaxation is skipped (cannot handle disordered structures).
+# See notebooks/03_partial_occupancy_handling.ipynb for details.
 ```
+
+`PredictionResult` fields include: `status` (SUCCESS / SUBSTITUTED_ONLY / PARTIAL_OCCUPANCY / SUBSTITUTION_FAILED / RELAX_FAILED / NO_CANDIDATE), `template_material_id`, `template_rank`, `substituted_structure`, `relaxed_structure`, `warnings`, and paths to any CIFs written to `output_dir`.
+
+For the low-level 5-step pipeline (descriptor → classifier → retrieval → substitution → relaxation) and per-step diagnostics, see `notebooks/01_predict_composition_example.ipynb` sections 1–7.
+
+**Out of scope**: highly complex hypothetical compositions (many elements with fractional stoichiometry, e.g., glass-electrolyte-like) are template-poor by construction and typically return `SUBSTITUTION_FAILED`.
 
 ## Reproducing the paper benchmark
 
